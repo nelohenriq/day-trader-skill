@@ -19,6 +19,7 @@
   "blocked": [],
   "allow_options": false,
   "allow_crypto": false,
+  "crypto_fee_pct": 0.25,
   "allow_margin": false,
   "allow_short": false,
   "pdt_guard": false,

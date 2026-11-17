@@ -203,7 +203,8 @@ Alpaca crypto has no bracket orders, so the flow has an extra step:
 
 1. `ticket.py show`, your yes, `place_crypto_order` for the ENTRY only, then
    `ticket.py result --status placed --filled-qty Q --filled-price P`.
-2. Nothing protects the position until the stop is in. Check the coins you hold
+2. Nothing protects the position until the stop is in. The ledger already holds the coins
+   net of the fee (`crypto_fee_pct`), so `protect` and `flatten` default to that amount. Check the coins you hold
    with `get_open_position` (Alpaca takes a small fee in coins, so the quantity
    is a little under the entry's), then run
    `ticket.py protect --symbol BTC-USD --qty <coins held>`.

@@ -373,8 +373,16 @@ class CryptoChecks(unittest.TestCase):
         r = self.run_one(crypto_order())
         self.assertEqual(r["verdict"], "PASS", r["reasons"])
         self.assertEqual(r["kind"], "entry")
-        self.assertAlmostEqual(r["max_loss"], 0.0577 * (64983.22 - 64624.55), places=2)
+        self.assertAlmostEqual(r["max_loss"], 0.0577 * (64983.22 - 64624.55 * 0.9975 ** 2), places=2)   # fees included
         self.assertTrue(any("AFTER the entry fills" in w for w in r["warnings"]))
+
+    def test_the_fee_can_push_a_loss_over_the_cap(self):
+        # 0.0577 BTC risks $20.70 before fees and $39.32 with them: a $30 cap blocks it, 0 % fee does not
+        r = self.run_one(crypto_order(), max_loss_per_trade_usd=30)
+        self.assertEqual(r["verdict"], "BLOCK")
+        self.assertIn("per trade", " ".join(r["reasons"]))
+        r = self.run_one(crypto_order(), max_loss_per_trade_usd=30, crypto_fee_pct=0)
+        self.assertEqual(r["verdict"], "PASS", r["reasons"])
 
     def test_the_same_order_as_a_stock_would_hit_the_window(self):
         stock = bracket("TSLA", 8, 364.18, 358.32, 370.04)

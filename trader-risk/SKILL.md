@@ -167,7 +167,8 @@ An order is crypto when it has `"asset": "crypto"` or a symbol like `BTC/USD`
   tickers and duplicates. A sell of coins you hold is an exit and is never
   blocked by the daily limits.
 - The fingerprint covers `after_fill`, so changing the stop after the check
-  invalidates the pass. Daily counters follow the New York date.
+  invalidates the pass. The max loss of a crypto buy includes both fees
+  (`crypto_fee_pct`, default 0.25), so a fee can push a loss over your cap. Daily counters follow the New York date.
 
 ## Rules
 

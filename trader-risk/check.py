@@ -72,7 +72,7 @@ DEFAULTS = {
     "min_order_usd": 5, "max_loss_per_trade_usd": 50, "max_daily_loss_usd": 150, "max_trades_per_day": 3,
     "max_orders_per_day": 10, "min_reward_risk": 1.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
-    "paper": True, "blocked": [], "allow_options": False, "allow_crypto": False, "allow_margin": False,
+    "paper": True, "blocked": [], "allow_options": False, "allow_crypto": False, "crypto_fee_pct": 0.25, "allow_margin": False,
     "allow_short": False, "pdt_guard": False,
 }
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
@@ -636,6 +636,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     risk_ps = risk_c if crypto else risk_c / 100.0
                     shares = q if q is not None else ((value or 0) / ref)
                     max_loss = round(shares * risk_ps, 2)
+                    if crypto and long and side == "buy":
+                        # Alpaca keeps a fee of every fill in coins: a coin bought at ref sells at the stop
+                        # for stop x keep x keep, so the real loss is a little bigger than ref - stop
+                        keep = 1 - (_f(c.get("crypto_fee_pct")) or 0) / 100.0
+                        max_loss = round(shares * (ref - stop * keep * keep), 2)
                     cap = _f(c.get("max_loss_per_trade_usd"))
                     if cap and max_loss > cap + CENT:
                         later.append("loss: %s %s x %s risk a %s = %s at the stop, over your %s max loss "

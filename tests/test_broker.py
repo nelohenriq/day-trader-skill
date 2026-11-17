@@ -168,13 +168,13 @@ class Crypto(unittest.TestCase):
         with open("trader/portfolio.json") as fh:
             pf = json.load(fh)
         self.assertEqual(pf["positions"][0]["ticker"], "BTC/USD")
-        self.assertEqual(pf["positions"][0]["shares"], 0.05762)
-        code, text, err = self.tk("protect", "--symbol", "BTC-USD", "--qty", "0.05762")
+        self.assertEqual(pf["positions"][0]["shares"], 0.05747595)    # 0.05762 less Alpaca's 0.25 % fee in coins
+        code, text, err = self.tk("protect", "--symbol", "BTC-USD", "--qty", "0.05747595")
         self.assertEqual(code, 0, err)
         with open("trader/orders.json") as fh:
             o = json.load(fh)["orders"][0]
         self.assertEqual((o["side"], o["type"], o["stop_price"], o["limit_price"], o["qty"]),
-                         ("sell", "stop_limit", "64624.55", "64301.43", "0.05762"))
+                         ("sell", "stop_limit", "64624.55", "64301.43", "0.05747595"))
         self.assertEqual(self.risk(), 0)
         code, text, _ = self.tk("show")
         self.assertIn("READY", text)
@@ -194,7 +194,7 @@ class Crypto(unittest.TestCase):
         self.assertEqual(code, 0, err)
         with open("trader/orders.json") as fh:
             o = json.load(fh)["orders"][0]
-        self.assertEqual((o["symbol"], o["side"], o["time_in_force"], o["qty"]), ("BTC/USD", "sell", "gtc", "0.05"))
+        self.assertEqual((o["symbol"], o["side"], o["time_in_force"], o["qty"]), ("BTC/USD", "sell", "gtc", "0.049875"))   # what is held after the fee
         self.assertIn("place_crypto_order", text)
 
     def test_stock_ticket_is_unchanged(self):

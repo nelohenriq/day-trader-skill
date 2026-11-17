@@ -37,6 +37,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -485,6 +486,11 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
     if qty <= 0 or price <= 0:
         raise TicketError("a fill needs a positive qty and price")
     cost = round(qty * price, 2)
+    if "/" in symbol and side == "buy":
+        # Alpaca keeps its fee of a crypto buy in coins: you pay for qty but hold a little less
+        fee = cfg.get("crypto_fee_pct")
+        keep = 1 - (0.25 if fee is None else float(fee)) / 100.0
+        qty = math.floor(qty * keep * 10 ** nd + 1e-9) / 10 ** nd
     pos = None
     for p in pf.setdefault("positions", []):
         if canon(p.get("ticker") or p.get("symbol") or "") == symbol:

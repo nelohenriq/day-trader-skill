@@ -162,6 +162,13 @@ A small budget meets the position cap first: BTC at $65,000 with a $5,000
 budget buys about 0.058 coins, so the $50 max loss is rarely the limit that
 binds.
 
+**Fees.** Alpaca takes `crypto_fee_pct` (default 0.25) of every crypto fill,
+and on a buy it takes it in coins: you pay for 0.0577 BTC and hold 0.0576. So
+the max-loss limit uses the real loss per coin (the entry less the stop times
+the coins you keep, twice), the stop-loss is sized to the coins you will hold,
+and the max loss shown includes both fees. A 0.55% stop costs about 0.5% more
+in fees, so a tight stop is mostly fee. Set `crypto_fee_pct` to your tier.
+
 ## Rules
 
 - Proposals only. This skill never calls a broker tool.

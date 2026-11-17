@@ -24,7 +24,7 @@ CONTRACT_CFG = {
     "min_reward_risk": 1.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "fractional": False, "broker": "alpaca", "paper": True, "blocked": [],
-    "allow_options": False, "allow_crypto": False, "allow_margin": False, "allow_short": False, "pdt_guard": False,
+    "allow_options": False, "allow_crypto": False, "crypto_fee_pct": 0.25, "allow_margin": False, "allow_short": False, "pdt_guard": False,
     "sec_user_agent": "Your Name you@example.com",
 }
 # v1's rules, for the weights mode tests
@@ -283,10 +283,30 @@ class Crypto(unittest.TestCase):
         self.assertEqual((o["symbol"], o["type"], o["time_in_force"], o["order_class"]), ("BTC/USD", "market", "gtc", "simple"))
         self.assertNotIn("take_profit_limit_price", o)
         sl = o["after_fill"]["stop_loss"]
-        self.assertEqual((sl["side"], sl["type"], sl["stop_price"], sl["qty"]), ("sell", "stop_limit", "64624.55", o["qty"]))
+        self.assertEqual((sl["side"], sl["type"], sl["stop_price"], sl["qty"]), ("sell", "stop_limit", "64624.55", "0.057562936"))
+        self.assertLess(float(sl["qty"]), float(o["qty"]))        # the stop sells what the 0.25 % fee left
         self.assertLess(float(sl["limit_price"]), float(sl["stop_price"]))
         self.assertEqual(o["after_fill"]["take_profit"]["how"], "alert")
         self.assertEqual(o["after_fill"]["exit_by"], "2026-11-18T03:30:00Z")
+
+    def test_fee_is_in_the_max_loss_and_the_stop_quantity(self):
+        s = self.size()
+        self.assertEqual(s["fee_pct"], 0.25)
+        self.assertEqual(str(s["net_qty"]), "0.057562936")        # 0.057707205 x 0.9975, rounded down
+        plain = float(s["qty"]) * (s["entry"] - s["stop"])
+        self.assertGreater(s["max_loss"], plain + 8)               # about $9 of fees on a $3,750 position
+
+    def test_fee_shrinks_a_loss_bound_order_so_the_cap_still_holds(self):
+        cfg = {"budget": 100000, "max_position_pct": 100, "max_order_usd": 1000000, "cash_buffer_pct": 0}
+        with_fee, no_fee = self.size(cfg=cfg), self.size(cfg=dict(cfg, crypto_fee_pct=0))
+        self.assertEqual(with_fee["bound_by"], "max loss")
+        self.assertLessEqual(with_fee["max_loss"], 50.0)
+        self.assertLess(with_fee["qty"], no_fee["qty"])
+        self.assertEqual(no_fee["net_qty"], no_fee["qty"])
+
+    def test_a_silly_fee_is_refused(self):
+        with self.assertRaises(size.SizeError):
+            self.size(cfg={"crypto_fee_pct": 9})
 
     def test_sub_dollar_coin(self):
         s = self.size(DOGE_PLAN, cfg={"max_position_pct": 100, "max_order_usd": 100000, "cash_buffer_pct": 0})

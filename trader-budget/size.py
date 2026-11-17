@@ -81,6 +81,7 @@ DEFAULTS = {
     "blocked": [],
     "allow_options": False,
     "allow_crypto": False,
+    "crypto_fee_pct": 0.25,        # Alpaca takes this much of every crypto fill, in coins on a buy
     "allow_margin": False,
     "allow_short": False,
     "pdt_guard": False,
@@ -379,6 +380,13 @@ def size_crypto(plan, cfg, budget=None, limit=None, price=None, cash=None, today
         raise SizeError("the target %s is not above the entry %s: the move has already happened. "
                         "Skip it or make a new plan with trader-exit" % (cmoney(target), cmoney(ref)))
     risk, reward = _d(ref) - _d(stop), _d(target) - _d(ref)
+    fee_pct = _f(c.get("crypto_fee_pct"))
+    fee_pct = 0.25 if fee_pct is None else fee_pct
+    if not 0 <= fee_pct < 5:
+        raise SizeError("crypto_fee_pct must be between 0 and 5 (percent per fill)")
+    keep = 1 - _d(fee_pct) / 100                       # the share of the coins you keep after a fill
+    # a coin bought at ref arrives as `keep` coins, sold at the stop it pays stop x keep: that is the real loss
+    loss_per_coin = _d(ref) - _d(stop) * keep * keep
 
     cash_buffer = round(budget * buf_pct / 100.0, 2)
     available = budget - cash_buffer
@@ -391,8 +399,8 @@ def size_crypto(plan, cfg, budget=None, limit=None, price=None, cash=None, today
     limits = []
     max_loss = _f(c.get("max_loss_per_trade_usd"))
     if max_loss:
-        limits.append({"name": "max loss", "usd": max_loss, "per": float(risk), "shares": coin_qty(max_loss, risk),
-                       "how": "%s max loss / %s risk a coin" % (money(max_loss), cmoney(risk))})
+        limits.append({"name": "max loss", "usd": max_loss, "per": float(risk), "shares": coin_qty(max_loss, loss_per_coin),
+                       "how": "%s max loss / %s a coin at the stop, fees included" % (money(max_loss), cmoney(loss_per_coin))})
     cap_pct = _f(c.get("max_position_pct"))
     if cap_pct:
         cap = round(budget * cap_pct / 100.0, 2)
@@ -409,7 +417,8 @@ def size_crypto(plan, cfg, budget=None, limit=None, price=None, cash=None, today
     for l in limits:
         l["binds"] = l["name"] == bound[0]
     cost = float((qty * _d(ref)).quantize(Decimal("0.01")))
-    loss = float((qty * risk).quantize(Decimal("0.01")))
+    loss = float((qty * loss_per_coin).quantize(Decimal("0.01")))
+    net_qty = (qty * keep).quantize(CRYPTO_QTY_STEP, rounding=ROUND_FLOOR)
     rr = float((reward / risk).quantize(Decimal("0.01")))
     refusal = None
     if qty == 0:
@@ -429,6 +438,7 @@ def size_crypto(plan, cfg, budget=None, limit=None, price=None, cash=None, today
         "budget": budget, "cash_buffer_pct": buf_pct, "cash_buffer": cash_buffer, "cash_available": available,
         "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
         "cost": cost, "max_loss": loss, "flat_by": None, "exit_by": plan.get("exit_by"), "price_step": step,
+        "fee_pct": fee_pct, "net_qty": net_qty,
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
     }
 
@@ -447,7 +457,8 @@ def crypto_order(s):
         o["limit_price"] = cprice(s["entry"], step)
     stop_limit = _d(s["stop"]) * (1 - STOP_LIMIT_GAP)
     o["after_fill"] = {
-        "stop_loss": {"symbol": o["symbol"], "side": "sell", "qty": qty, "type": "stop_limit", "time_in_force": "gtc",
+        "stop_loss": {"symbol": o["symbol"], "side": "sell", "qty": format(s["net_qty"].normalize(), "f"),
+                      "type": "stop_limit", "time_in_force": "gtc",
                       "stop_price": cprice(s["stop"], step), "limit_price": cprice(stop_limit, step)},
         "take_profit": {"how": "alert", "price": cprice(s["target"], step),
                         "why": "a second resting sell would lock the same coins; ring an alert and sell by hand"},
@@ -481,6 +492,8 @@ def crypto_report(s, order, notes=()):
         return "\n".join(lines)
     lines.append("Size: %s %s = %s at %s. Max loss at the stop: %s." % (
         order["qty"], s["symbol"], money(s["cost"]), cmoney(s["entry"]), money(s["max_loss"])))
+    lines.append("Fees: Alpaca takes %s%% of each fill, so the buy leaves you %s coins and the stop sells those. "
+                 "The max loss above includes both fees." % (_num(s["fee_pct"]), format(s["net_qty"].normalize(), "f")))
     lines.append("A stop is an order, not a promise: crypto never halts, and a fast move can fill below %s." % cmoney(s["stop"]))
     lines += ["", "Proposed orders (place_crypto_order arguments, nothing has been placed):"]
     how = "limit %s" % order["limit_price"] if order["type"] == "limit" else "market"
