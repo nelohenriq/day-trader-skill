@@ -44,7 +44,7 @@ import sys
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
-                 "stop_loss_limit_price", "advanced_instructions")
+                 "stop_loss_limit_price", "advanced_instructions", "asset", "after_fill")
 STRING_FIELDS = ("qty", "notional", "limit_price", "stop_price", "trail_price", "trail_percent",
                  "take_profit_limit_price", "stop_loss_stop_price", "stop_loss_limit_price")
 TIF_WORDS = {"day": "good for today", "gtc": "good until canceled", "opg": "at the open",

@@ -345,6 +345,90 @@ class Exits(unittest.TestCase):
         self.assertEqual(res["results"][1]["kind"], "exit")
 
 
+def crypto_order(qty="0.0577", entry=64983.22, stop=64624.55, target=65521.23, sym="BTC/USD", step="0.01", **over):
+    o = {"asset": "crypto", "symbol": sym, "side": "buy", "qty": qty, "type": "market", "time_in_force": "gtc",
+         "order_class": "simple",
+         "after_fill": {"stop_loss": {"symbol": sym, "side": "sell", "qty": qty, "type": "stop_limit",
+                                      "time_in_force": "gtc", "stop_price": "%s" % stop, "limit_price": "%s" % (stop * 0.995)},
+                        "take_profit": {"how": "alert", "price": "%s" % target}},
+         "plan": {"entry": entry, "stop": stop, "target": target}}
+    o.update(over)
+    return o
+
+
+class CryptoChecks(unittest.TestCase):
+    """Crypto: 24/7 (no market window), fractional, a stop placed after the fill, off until allow_crypto."""
+    SAT_NIGHT = "2026-11-21 23:30"      # Saturday, the NYSE is closed
+
+    def run_one(self, order, now=SAT_NIGHT, **over):
+        c = cfg(allow_crypto=True, budget=5000, **over)
+        return check.check([order], c, now=at(now), today=now[:10])["results"][0]
+
+    def test_off_by_default(self):
+        r = check.check([crypto_order()], cfg(budget=5000), now=at(self.SAT_NIGHT))["results"][0]
+        self.assertEqual(r["verdict"], "BLOCK")
+        self.assertIn("crypto is off", " ".join(r["reasons"]))
+
+    def test_passes_on_a_saturday_night_when_allowed(self):
+        r = self.run_one(crypto_order())
+        self.assertEqual(r["verdict"], "PASS", r["reasons"])
+        self.assertEqual(r["kind"], "entry")
+        self.assertAlmostEqual(r["max_loss"], 0.0577 * (64983.22 - 64624.55), places=2)
+        self.assertTrue(any("AFTER the entry fills" in w for w in r["warnings"]))
+
+    def test_the_same_order_as_a_stock_would_hit_the_window(self):
+        stock = bracket("TSLA", 8, 364.18, 358.32, 370.04)
+        r = check.check([stock], cfg(budget=5000), now=at(self.SAT_NIGHT), today="2026-11-21")["results"][0]
+        self.assertIn("window:", " ".join(r["reasons"]))
+
+    def test_day_time_in_force_and_brackets_are_refused(self):
+        r = self.run_one(crypto_order(time_in_force="day"))
+        self.assertIn("gtc or ioc", " ".join(r["reasons"]))
+        r = self.run_one(crypto_order(order_class="bracket", take_profit_limit_price="65521.23",
+                                      stop_loss_stop_price="64624.55"))
+        self.assertIn("no bracket", " ".join(r["reasons"]))
+
+    def test_loss_cap_uses_fractional_coins(self):
+        r = self.run_one(crypto_order(qty="0.2"))      # 0.2 x 358.67 = 71.73 > 50
+        self.assertEqual(r["verdict"], "BLOCK")
+        self.assertIn("loss:", " ".join(r["reasons"]))
+        self.assertIn("coins", " ".join(r["reasons"]))
+
+    def test_sub_dollar_coin_keeps_precision(self):
+        o = crypto_order(qty="800", entry=0.062, stop=0.06025, target=0.0655, sym="DOGE/USD")
+        r = self.run_one(o, max_position_pct=100, max_order_usd=100000, cash_buffer_pct=0)
+        self.assertEqual(r["verdict"], "PASS", r["reasons"])
+        self.assertAlmostEqual(r["risk_per_share"], 0.00175, places=8)
+        self.assertEqual(r["reward_risk"], 2.0)
+
+    def test_stop_above_the_entry_is_blocked(self):
+        r = self.run_one(crypto_order(stop=65000.0))
+        self.assertIn("stop:", " ".join(r["reasons"]))
+
+    def test_missing_stop_is_blocked_when_required(self):
+        o = crypto_order()
+        del o["after_fill"], o["plan"]["stop"]
+        r = self.run_one(o)
+        self.assertIn("stop: no stop", " ".join(r["reasons"]))
+
+    def test_dash_and_slash_spellings_are_one_asset(self):
+        self.assertEqual(check.canon("btc-usd"), "BTC/USD")
+        self.assertEqual(check.canon("TSLA"), "TSLA")
+        c = cfg(allow_crypto=True, budget=5000, max_loss_per_trade_usd=0)
+        pf = {"cash": 1000, "positions": [{"symbol": "BTC-USD", "qty": 0.5}]}
+        sell = {"asset": "crypto", "symbol": "BTC/USD", "side": "sell", "qty": "0.5", "type": "market",
+                "time_in_force": "gtc"}
+        r = check.check([sell], c, portfolio=pf, prices={"BTC-USD": 64000}, now=at(self.SAT_NIGHT),
+                        today="2026-11-21")["results"][0]
+        self.assertEqual(r["kind"], "exit")
+        self.assertEqual(r["verdict"], "PASS", r["reasons"])
+
+    def test_fingerprint_covers_the_stop_loss_leg(self):
+        a, b = crypto_order(), crypto_order()
+        b["after_fill"]["stop_loss"]["stop_price"] = "60000"
+        self.assertNotEqual(check.fingerprint(a), check.fingerprint(b))
+
+
 class V1Checks(unittest.TestCase):
     """v1's long-term checks still hold (day-trade checks off)."""
 
@@ -392,7 +476,8 @@ class V1Checks(unittest.TestCase):
 
     def test_crypto_and_junk_symbols(self):
         crypto = {"symbol": "BTC/USD", "side": "buy", "notional": "50", "type": "market", "time_in_force": "day"}
-        self.assertIn("stocks and ETFs only", " ".join(self.one(crypto)["reasons"]))
+        self.assertIn("crypto is off", " ".join(self.one(crypto)["reasons"]))
+        self.assertIn("stocks and ETFs only", " ".join(self.one(dict(crypto, symbol="BTC USD!"))["reasons"]))
 
     def test_format_rules(self):
         both = dict(buy("KO", 100), qty="1")

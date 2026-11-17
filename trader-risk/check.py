@@ -72,18 +72,19 @@ DEFAULTS = {
     "min_order_usd": 5, "max_loss_per_trade_usd": 50, "max_daily_loss_usd": 150, "max_trades_per_day": 3,
     "max_orders_per_day": 10, "min_reward_risk": 1.0, "require_stop": True,
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
-    "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
-    "pdt_guard": False,
+    "paper": True, "blocked": [], "allow_options": False, "allow_crypto": False, "allow_margin": False,
+    "allow_short": False, "pdt_guard": False,
 }
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
-                 "stop_loss_limit_price", "advanced_instructions")
+                 "stop_loss_limit_price", "advanced_instructions", "asset", "after_fill")
 PRICE_FIELDS = ("qty", "notional", "limit_price", "stop_price", "take_profit_limit_price",
                 "stop_loss_stop_price", "stop_loss_limit_price")
 TYPES = {"market", "limit", "stop", "stop_limit", "trailing_stop"}
 TIFS = {"day", "gtc", "opg", "cls", "ioc", "fok"}
 OCC = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+CRYPTO = re.compile(r"^[A-Z0-9]{2,10}/USD[TC]?$")
 TICKER = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 CENT = 0.005
@@ -295,6 +296,19 @@ def _p(x):
     return "%.2f" % float(x)
 
 
+def _pc(x):
+    """A crypto price: cents from a dollar up, six places under it."""
+    x = float(x)
+    return "%.2f" % x if abs(x) >= 1 else ("%.6f" % x).rstrip("0").rstrip(".")
+
+
+def canon(sym):
+    """BTC-USD, btc/usd -> BTC/USD: one spelling for a crypto pair. Anything else just upper-cased."""
+    s_ = str(sym).strip().upper()
+    m = re.match(r"^([A-Z0-9]{2,10})[/-](USD[TC]?)$", s_)
+    return "%s/%s" % (m.group(1), m.group(2)) if m else s_
+
+
 def account(cfg, portfolio, prices):
     """Starting account: cash and position values. No portfolio = a fresh
     account funded with the budget."""
@@ -310,7 +324,7 @@ def account(cfg, portfolio, prices):
         raise RiskError("portfolio.json needs a \"cash\" number")
     shares, values = {}, {}
     for p in portfolio.get("positions", []):
-        t = str(p.get("ticker") or p.get("symbol") or "").upper()
+        t = canon(p.get("ticker") or p.get("symbol") or "")
         if not t:
             continue
         n = _f(p.get("shares", p.get("qty")))
@@ -377,7 +391,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
     c = dict(DEFAULTS)
     c.update(cfg or {})
-    prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
+    prices = {canon(k): float(v) for k, v in (prices or {}).items() if _f(v)}
+    price_times = {canon(k): v for k, v in price_times.items()} if price_times else price_times
     now_utc = now or parse_now(None)
     now_et = to_eastern(now_utc)
     today = today or now_et.date().isoformat()
@@ -418,10 +433,12 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     for i, o in enumerate(orders, 1):
         reasons, warns, info = [], [], []
         later = []                       # entry-only reasons, turned into warnings for an exit
-        sym = str(o.get("symbol", "")).strip().upper()
+        sym = canon(o.get("symbol", ""))
+        crypto = o.get("asset") == "crypto" or "/" in sym
+        pxf, eps = (_pc, 1e-9) if crypto else (_p, CENT)
         side = str(o.get("side", "")).strip().lower()
         typ = str(o.get("type", "market")).strip().lower()
-        tif = str(o.get("time_in_force", "day")).strip().lower()
+        tif = str(o.get("time_in_force", "gtc" if crypto else "day")).strip().lower()
         qty, notional = o.get("qty"), o.get("notional")
         plan = o.get("plan") if isinstance(o.get("plan"), dict) else {}
         oc = str(o.get("order_class") or "").strip().lower()
@@ -448,7 +465,16 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             reasons.append("format: unknown order type %r" % typ)
         if tif not in TIFS:
             reasons.append("format: unknown time_in_force %r" % tif)
-        if notional is not None and (typ != "market" or tif != "day"):
+        if crypto:
+            if tif not in ("gtc", "ioc"):
+                reasons.append("format: a crypto order needs time_in_force gtc or ioc (Alpaca has no day orders "
+                               "for crypto), got %r" % tif)
+            if notional is not None and typ != "market":
+                reasons.append("format: a notional (dollar) crypto order must be a market order")
+            if bracket:
+                reasons.append("format: crypto has no bracket orders: the stop-loss goes in after_fill and "
+                               "is placed after the entry fills")
+        elif notional is not None and (typ != "market" or tif != "day"):
             reasons.append("format: a notional (dollar) order must be a market order with time_in_force day")
         if typ in ("limit", "stop_limit") and o.get("limit_price") is None:
             reasons.append("format: a %s order needs a limit_price" % typ)
@@ -458,7 +484,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             reasons.append("format: extended hours needs a limit order with time_in_force day or gtc")
         if o.get("stop_loss_limit_price") is not None and o.get("stop_loss_stop_price") is None:
             reasons.append("format: stop_loss_limit_price needs a stop_loss_stop_price")
-        if bracket:
+        if bracket and not crypto:
             if notional is not None:
                 reasons.append("format: a bracket order needs a whole-share qty, not a notional amount")
             elif _f(qty) is not None and abs(_f(qty) - round(_f(qty))) > 1e-9:
@@ -468,12 +494,20 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if o.get("take_profit_limit_price") is None or o.get("stop_loss_stop_price") is None:
                 reasons.append("format: a bracket order needs both take_profit_limit_price and "
                                "stop_loss_stop_price")
-        elif oc or o.get("advanced_instructions"):
+        elif (oc and oc != "simple") or o.get("advanced_instructions"):
             warns.append("advanced order (%s): check every leg before you say yes"
                          % (oc or "advanced_instructions"))
 
         # asset
-        if sym and OCC.match(sym.replace(" ", "")):
+        if crypto:
+            if not CRYPTO.match(sym):
+                reasons.append("asset: %s is not a crypto pair like BTC/USD" % sym)
+            elif not c.get("allow_crypto"):
+                reasons.append("asset: %s is crypto; crypto is off (\"allow_crypto\": false)" % sym)
+            else:
+                warns.append("crypto order: it trades around the clock, never halts, and a stop can fill far "
+                             "past its price")
+        elif sym and OCC.match(sym.replace(" ", "")):
             if not c.get("allow_options"):
                 reasons.append("asset: %s is an option contract; options are off "
                                "(\"allow_options\": false)" % sym)
@@ -495,10 +529,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             cands = [(p, w) for p, w in ((plan_entry, "plan"), (live, "price")) if p]
             if cands:
                 ref, ref_from = max(cands, key=lambda x: x[0])
-                ref = _cent(ref)
-                if live and ref_from == "price" and plan_entry and live > plan_entry + CENT:
+                ref = ref if crypto else _cent(ref)
+                if live and ref_from == "price" and plan_entry and live > plan_entry + eps:
                     info.append("%s last %s is above the plan's entry %s: the risk is measured from %s"
-                                % (sym, _p(ref), _p(plan_entry), _p(ref)))
+                                % (sym, pxf(ref), pxf(plan_entry), pxf(ref)))
             elif sym in prices:
                 ref, ref_from = prices[sym], "stale price"
         if plan_entry and live is None and sym in prices and price_times is not None and typ == "market":
@@ -571,15 +605,22 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         max_loss = risk_ps = rr = stop = target = None
         if kind == "entry" and side in ("buy", "sell"):
             long = side == "buy"
-            leg_stop, plan_stop = _f(o.get("stop_loss_stop_price")), _f(plan.get("stop"))
+            af = o.get("after_fill") if isinstance(o.get("after_fill"), dict) else {}
+            af_stop = _f((af.get("stop_loss") or {}).get("stop_price")) if crypto else None
+            leg_stop, plan_stop = (af_stop if crypto else _f(o.get("stop_loss_stop_price"))), _f(plan.get("stop"))
             stop = leg_stop if leg_stop else plan_stop
-            target = _f(o.get("take_profit_limit_price")) or _f(plan.get("target"))
-            if leg_stop and plan_stop and abs(leg_stop - plan_stop) > CENT:
-                warns.append("the bracket stop %s differs from the plan's stop %s: the bracket's is the one "
-                             "the broker uses" % (_p(leg_stop), _p(plan_stop)))
-            if stop and not leg_stop:
+            target = (_f((af.get("take_profit") or {}).get("price")) if crypto else None) \
+                or _f(o.get("take_profit_limit_price")) or _f(plan.get("target"))
+            if leg_stop and plan_stop and abs(leg_stop - plan_stop) > eps:
+                warns.append("the %s stop %s differs from the plan's stop %s: the %s one is what the broker uses"
+                             % ("after-fill" if crypto else "bracket", pxf(leg_stop), pxf(plan_stop),
+                                "after-fill" if crypto else "bracket's"))
+            if crypto and leg_stop:
+                warns.append("the stop %s is a separate order placed AFTER the entry fills: until then nothing "
+                             "protects the position, and the target is an alert, not a resting order" % pxf(leg_stop))
+            elif stop and not leg_stop:
                 warns.append("the stop %s is in the plan only, not at the broker: set a stop alert "
-                             "(trader-alerts: alerts.py add --from-plan)" % _p(stop))
+                             "(trader-alerts: alerts.py add --from-plan)" % pxf(stop))
             if not stop:
                 if c.get("require_stop", True):
                     later.append("stop: no stop. Every entry needs one (\"require_stop\": true): a bracket "
@@ -587,28 +628,30 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 else:
                     warns.append("no stop: the max loss is not capped, so it is not counted in the daily loss")
             elif ref:
-                if (long and stop >= ref - CENT) or (not long and stop <= ref + CENT):
+                if (long and stop >= ref - eps) or (not long and stop <= ref + eps):
                     later.append("stop: the stop %s must be %s the entry %s for a %s"
-                                 % (_p(stop), "below" if long else "above", _p(ref), side))
+                                 % (pxf(stop), "below" if long else "above", pxf(ref), side))
                 else:
-                    risk_c = int(round(abs(ref - stop) * 100))
-                    risk_ps = risk_c / 100.0
+                    risk_c = abs(ref - stop) if crypto else int(round(abs(ref - stop) * 100))
+                    risk_ps = risk_c if crypto else risk_c / 100.0
                     shares = q if q is not None else ((value or 0) / ref)
                     max_loss = round(shares * risk_ps, 2)
                     cap = _f(c.get("max_loss_per_trade_usd"))
                     if cap and max_loss > cap + CENT:
-                        later.append("loss: %s shares x %s risk a share = %s at the stop, over your %s max loss "
-                                     "per trade" % (_num(shares), _p(risk_ps), money(max_loss), money(cap)))
+                        later.append("loss: %s %s x %s risk a %s = %s at the stop, over your %s max loss "
+                                     "per trade" % (_num(shares), "coins" if crypto else "shares", pxf(risk_ps),
+                                                    "coin" if crypto else "share", money(max_loss), money(cap)))
                     min_rr = _f(c.get("min_reward_risk"))
                     if target:
-                        if (long and target <= ref + CENT) or (not long and target >= ref - CENT):
+                        if (long and target <= ref + eps) or (not long and target >= ref - eps):
                             later.append("target: the target %s must be %s the entry %s"
-                                         % (_p(target), "above" if long else "below", _p(ref)))
+                                         % (pxf(target), "above" if long else "below", pxf(ref)))
                         else:
-                            rr = round(int(round(abs(target - ref) * 100)) / float(risk_c), 2)
+                            rr = round((abs(target - ref) / risk_c) if crypto
+                                       else int(round(abs(target - ref) * 100)) / float(risk_c), 2)
                             if min_rr and rr < min_rr - 1e-9:
                                 later.append("reward:risk: %.2f (target %s, entry %s, stop %s) is under your "
-                                             "minimum %s" % (rr, _p(target), _p(ref), _p(stop), _num(min_rr)))
+                                             "minimum %s" % (rr, pxf(target), pxf(ref), pxf(stop), _num(min_rr)))
                     elif min_rr:
                         later.append("reward:risk: no target to measure it against (min_reward_risk %s)"
                                      % _num(min_rr))
@@ -623,15 +666,16 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             if cap_t and len(entries_today) + batch_entries >= cap_t:
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
-            later.extend(win_reasons)
-            if c.get("pdt_guard") and pdt_n >= 3:
+            if not crypto:
+                later.extend(win_reasons)        # crypto has no market hours: no window, no holiday list
+            if c.get("pdt_guard") and pdt_n >= 3 and not crypto:
                 later.append("pdt: %d day trades in the last 5 business days (%s); a 4th trips the "
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
                              % (pdt_n, ", ".join(pdt_list)))
             if stop and ref and risk_ps:
-                info.append("entry %s (%s), stop %s, target %s: risk %s a share"
-                            % (_p(ref), REF_WORDS.get(ref_from, ref_from), _p(stop),
-                               _p(target) if target else "none", _p(risk_ps)))
+                info.append("entry %s (%s), stop %s, target %s: risk %s a %s"
+                            % (pxf(ref), REF_WORDS.get(ref_from, ref_from), pxf(stop),
+                               pxf(target) if target else "none", pxf(risk_ps), "coin" if crypto else "share"))
                 info.append("max loss %s%s, reward:risk %s%s"
                             % (money(max_loss), (" (limit %s)" % money(c["max_loss_per_trade_usd"]))
                                if _f(c.get("max_loss_per_trade_usd")) else "",
@@ -683,9 +727,9 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                     acct["shares"][sym] = held - value / ref
         results.append({
             "index": i, "symbol": sym, "side": side, "kind": kind,
-            "amount": money(_f(notional) or 0) if notional is not None else ("%s shares" % qty),
+            "amount": money(_f(notional) or 0) if notional is not None else ("%s %s" % (qty, "coins" if crypto else "shares")),
             "value_usd": round(value, 2) if value is not None else None,
-            "entry_ref": round(ref, 2) if ref else None, "entry_ref_from": ref_from,
+            "entry_ref": (round(ref, 6) if crypto else round(ref, 2)) if ref else None, "entry_ref_from": ref_from,
             "stop": stop, "target": target, "risk_per_share": risk_ps, "max_loss": max_loss,
             "reward_risk": rr, "fingerprint": fingerprint(o), "verdict": verdict,
             "reasons": reasons, "warnings": warns, "info": info,
