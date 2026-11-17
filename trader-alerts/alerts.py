@@ -63,6 +63,22 @@ BACKOFF = 2.0  # seconds to wait before the one retry after a 429
 YAHOO_HOSTS = ("query2.finance.yahoo.com", "query1.finance.yahoo.com")
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
+
+def is_crypto_sym(sym):
+    """BTC/USD, BTC-USD: a crypto pair (24/7, no NYSE calendar)."""
+    return bool(re.match(r"^[A-Z0-9]{2,10}[/-]USD[TC]?$", str(sym).strip().upper()))
+
+
+def pc(x):
+    """A crypto price: cents from a dollar up, six places under it."""
+    x = float(x)
+    return "%.2f" % x if abs(x) >= 1 else ("%.6f" % x).rstrip("0").rstrip(".")
+
+
+def fp(sym, x):
+    """Format a price for the symbol: crypto keeps its digits, a stock gets cents."""
+    return pc(x) if is_crypto_sym(sym) else "%.2f" % float(x)
+
 NYSE_HOLIDAYS = {
     "2026-01-01": "New Year's Day",
     "2026-01-19": "Martin Luther King, Jr. Day",
@@ -198,7 +214,7 @@ def stooq_url(sym):
 
 
 def yahoo_url(sym, host=YAHOO_HOSTS[0]):
-    return "https://%s/v8/finance/chart/%s?range=1d&interval=1d" % (host, sym.upper().replace(".", "-"))
+    return "https://%s/v8/finance/chart/%s?range=1d&interval=1d" % (host, sym.upper().replace(".", "-").replace("/", "-"))
 
 
 def parse_stooq(text, sym):
@@ -321,6 +337,8 @@ def get_quotes(symbols, source="yahoo", offline=None, pause=PAUSE):
             else:
                 if i and pause:
                     _sleep(pause)
+                if source == "stooq" and is_crypto_sym(sym):
+                    raise AlertError("Stooq has no crypto quotes for %s: use --source yahoo" % sym)
                 text = fetch(stooq_url(sym)) if source == "stooq" else fetch_yahoo(sym)
             quotes[sym] = parse_stooq(text, sym) if source == "stooq" else parse_yahoo(text, sym)
         except AlertError as e:
@@ -374,8 +392,8 @@ def _read(path, default):
 
 # ---------------------------------------------------------------- rules
 
-PRICE_TYPES = {"above", "below", "stop", "target", "pct_move", "opening_bell", "time"}
-NO_QUOTE = {"opening_bell", "time"}
+PRICE_TYPES = {"above", "below", "stop", "target", "pct_move", "opening_bell", "time", "exit_by"}
+NO_QUOTE = {"opening_bell", "time", "exit_by"}
 
 
 def _hhmm(text):
@@ -397,12 +415,29 @@ def validate(rule):
         raise AlertError("rule %s needs a numeric pct" % rule.get("id"))
     if t == "time" and _hhmm(rule.get("at")) is None:
         raise AlertError("rule %s needs \"at\" as a New York time like \"15:55\"" % rule.get("id"))
+    if t == "exit_by" and not _utc_stamp(rule.get("at_utc")):
+        raise AlertError("rule %s needs \"at_utc\" as a UTC time like 2026-11-18T03:30:00Z" % rule.get("id"))
+    if rule.get("until") and not _utc_stamp(rule["until"]):
+        raise AlertError("rule %s: until must be a UTC time like 2026-11-18T03:30:00Z" % rule.get("id"))
     if rule.get("date") and not re.match(r"^\d{4}-\d{2}-\d{2}$", str(rule["date"])):
         raise AlertError("rule %s: date must be YYYY-MM-DD" % rule.get("id"))
 
 
-def active(rule, today):
-    """A rule with a "date" is watched on that New York date only."""
+def _utc_stamp(text):
+    """2026-11-18T03:30:00Z -> naive UTC datetime, or None."""
+    try:
+        return datetime.datetime.strptime(str(text)[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+
+
+def active(rule, today, now_utc=None):
+    """A rule with a "date" is watched on that New York date only; one with "until" (crypto, UTC)
+    is watched until that moment, across midnight."""
+    if rule.get("until") and now_utc is not None:
+        end = _utc_stamp(rule["until"])
+        if end and now_utc > end:
+            return False
     return not rule.get("date") or str(rule["date"]) == today
 
 
@@ -436,7 +471,19 @@ def evaluate(rules, quotes, status, state, now_utc):
     for r in rules:
         validate(r)
         rid = r.get("id") or "%s-%s" % (r.get("symbol", "market"), r["type"])
-        if not active(r, today):
+        if r["type"] == "exit_by":
+            at = _utc_stamp(r.get("at_utc"))
+            if now_utc >= at and not rung.get(rid):
+                sym = str(r.get("symbol") or "").upper()
+                rings.append({"id": rid, "symbol": sym,
+                              "message": "%s: it is %s UTC (set for %s UTC). If %s is still open, close it: "
+                                         "trader-broker flatten --symbol %s builds the sell ticket (cancel the resting "
+                                         "stop-loss first), then trader-risk and your yes."
+                                         % ((r.get("label") or "exit by").capitalize(), now_utc.strftime("%Y-%m-%d %H:%M"),
+                                            at.strftime("%Y-%m-%d %H:%M"), sym or "the position", sym or "SYMBOL")})
+                rung[rid] = stamp
+            continue
+        if not active(r, today, now_utc):
             continue
         typ = {"stop": "below", "target": "above"}.get(r["type"], r["type"])
         if typ == "opening_bell":
@@ -471,8 +518,10 @@ def evaluate(rules, quotes, status, state, now_utc):
             if hit and rid not in rung:
                 word = "at or above" if typ == "above" else "at or below"
                 label = {"stop": "stop", "target": "target"}.get(r["type"], "alert level")
-                rings.append({"id": rid, "symbol": sym, "message": "%s %s $%.2f: %s your %s $%s%s."
-                              % (sym, "is" if status["open"] else "last", p, word, label, _n(r["price"]),
+                crypto = is_crypto_sym(sym)
+                rings.append({"id": rid, "symbol": sym, "message": "%s %s $%s: %s your %s $%s%s."
+                              % (sym, "is" if (status["open"] or crypto) else "last", fp(sym, p), word, label,
+                                 pc(r["price"]) if crypto else _n(r["price"]),
                                  (" (" + r["note"] + ")") if r.get("note") else "")})
                 rung[rid] = stamp
             elif not hit and rid in rung and r.get("rearm"):
@@ -485,8 +534,8 @@ def evaluate(rules, quotes, status, state, now_utc):
             want = r.get("direction")
             hit = abs(move) >= r["pct"] and (not want or (want == "up") == (move > 0))
             if hit and not _rang_today(rung.get(rid), today):
-                rings.append({"id": rid, "symbol": sym, "message": "%s moved %+.2f%% to $%.2f (from $%.2f)."
-                              % (sym, move, p, float(ref))})
+                rings.append({"id": rid, "symbol": sym, "message": "%s moved %+.2f%% to $%s (from $%s)."
+                              % (sym, move, fp(sym, p), fp(sym, ref))})
                 rung[rid] = stamp
     state["last_check"] = stamp
     return rings, state
@@ -503,6 +552,7 @@ def rules_from_plan(plan, cfg_flat_by=None):
         raise AlertError("the plan has no symbol (run trader-exit first)")
     sym = str(plan["symbol"]).upper()
     out = []
+    crypto = plan.get("asset") == "crypto" or is_crypto_sym(sym)
     for key, typ, word in (("stop", "stop", "plan stop"), ("target", "target", "plan target")):
         v = plan.get(key)
         if not isinstance(v, (int, float)) or v <= 0:
@@ -510,6 +560,20 @@ def rules_from_plan(plan, cfg_flat_by=None):
         label = plan.get("%s_label" % key)
         out.append({"id": "%s-plan-%s" % (sym.lower(), key), "symbol": sym, "type": typ, "price": float(v),
                     "note": word + (": " + label if label else "")})
+    if crypto:
+        until = plan.get("exit_by")
+        for r in out:
+            r["id"] = r["id"].replace("/", "").replace("-usd", "usd")
+            if r["type"] == "target":
+                r["note"] += " (crypto has no resting target order: sell by hand)"
+            if until:
+                r["until"] = until
+        if until:
+            if not _utc_stamp(until):
+                raise AlertError("the plan's exit_by %r is not a UTC time like 2026-11-18T03:30:00Z" % until)
+            out.append({"id": "%s-exit-by" % sym.lower().replace("/", "").replace("-", ""), "symbol": sym,
+                        "type": "exit_by", "at_utc": until, "label": "exit by"})
+        return out                      # no calendar, no date, no flat-by close: the alerts run until exit_by
     flat = plan.get("flat_by") or cfg_flat_by or "15:55"
     if _hhmm(flat) is None:
         raise AlertError("the plan's flat_by %r is not a time like 15:55" % flat)
@@ -576,7 +640,7 @@ def cmd_quote(a):
                 chg = ""
                 if q.get("prev_close"):
                     chg = " (%+.2f%% vs prev close $%.2f)" % (100.0 * (q["price"] / q["prev_close"] - 1), q["prev_close"])
-                print("%-6s $%.2f%s  %s  [%s]" % (s, q["price"], chg, q.get("time", ""), q["source"]))
+                print("%-6s $%s%s  %s  [%s]" % (s, fp(s, q["price"]), chg, q.get("time", ""), q["source"]))
         for e in errors:
             print("error: " + e)
         if a.write and quotes:
@@ -592,7 +656,7 @@ def cmd_check(a):
     rules = doc["rules"]
     now = parse_now(a.now)
     status = market_status(now)
-    watched = [r for r in rules if active(r, status["date"])]
+    watched = [r for r in rules if r.get("type") == "exit_by" or active(r, status["date"], now)]
     syms = _dedupe([str(r.get("symbol", "")).upper() for r in watched if r.get("type") not in NO_QUOTE])
     quotes, errors = (get_quotes(syms, a.source, a.offline) if syms else ({}, []))
     state = _read(a.state, {})
@@ -605,17 +669,25 @@ def cmd_check(a):
         print(json.dumps({"market": status, "rings": rings, "errors": errors,
                           "quotes": {s: q["price"] for s, q in quotes.items()}}, indent=2))
     else:
-        print("NYSE %s (%s New York, %s)." % ("OPEN" if status["open"] else "closed", status["now_new_york"],
-                                              status["reason"]))
+        crypto_only = bool(watched) and all(is_crypto_sym(r.get("symbol", "")) for r in watched)
+        if crypto_only:
+            print("Crypto trades 24/7 (%s UTC; New York %s)." % (now.strftime("%Y-%m-%d %H:%M"), status["now_new_york"]))
+        else:
+            print("NYSE %s (%s New York, %s)." % ("OPEN" if status["open"] else "closed", status["now_new_york"],
+                                                  status["reason"]))
         for r in rings:
             print("ALERT " + r["message"])
         if not rings:
             print("Nothing hit. %d rule(s) watched today%s." % (
-                len(watched), (", " + ", ".join("%s $%.2f" % (s, quotes[s]["price"]) for s in syms if s in quotes))
+                len(watched), (", " + ", ".join("%s $%s" % (s, fp(s, quotes[s]["price"])) for s in syms if s in quotes))
                 if quotes else ""))
         for e in errors:
             print("error: " + e)
-        if rings:
+        if rings and any(is_crypto_sym(r.get("symbol", "")) for r in rings):
+            print("An alert is information, not an order. Crypto has no bracket: only the stop-loss rests at the "
+                  "broker, and the target is yours to act on. Check get_open_position and record any fill "
+                  "(ticket.py fill). To sell: cancel the resting stop, then ticket.py flatten, trader-risk and your yes.")
+        elif rings:
             print("An alert is information, not an order. A bracket's stop-loss and take-profit already sit at "
                   "the broker: check get_open_position and record any fill (ticket.py fill). To close a "
                   "position yourself: ticket.py flatten, then trader-risk and your yes.")
@@ -641,8 +713,11 @@ def cmd_add(a):
         _write(a.rules, doc)
         for r in new:
             print("Added %s: %s" % (r["id"], json.dumps(r)))
+        crypto_plan = plan.get("asset") == "crypto" or is_crypto_sym(plan.get("symbol", ""))
         print("Run alerts.py check every few minutes while the trade is open (a scheduled task or /loop). "
-              "Free quotes are delayed; the broker's bracket orders are what actually stop you out.")
+              + ("Free quotes are delayed; the target and exit-by are alerts only, and only the stop-loss ORDER stops you out."
+                 if crypto_plan else
+                 "Free quotes are delayed; the broker's bracket orders are what actually stop you out."))
         return 0
     if a.opening_bell:
         rule = {"id": a.id or "opening-bell", "type": "opening_bell"}

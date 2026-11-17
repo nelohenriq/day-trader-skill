@@ -323,6 +323,87 @@ class Rules(unittest.TestCase):
             alerts.rules_from_plan({"symbol": "TSLA", "stop": 358.32})
 
 
+BTC_PLAN = {"symbol": "BTC-USD", "asset": "crypto", "date": "2026-11-17", "stop": 64624.55, "target": 65521.23,
+            "stop_label": "opening-range midpoint", "target_label": "1.5R", "flat_by": None,
+            "exit_by": "2026-11-18T03:30:00Z"}
+
+
+class Crypto(unittest.TestCase):
+    NOW = DT(2026, 11, 17, 5, 30)    # a Tuesday 00:30 New York: the NYSE is closed, crypto is not
+    STATUS = None
+
+    def status(self, now=None):
+        return alerts.market_status(now or self.NOW)
+
+    def test_symbol_detection_and_formatting(self):
+        self.assertTrue(alerts.is_crypto_sym("btc/usd"))
+        self.assertTrue(alerts.is_crypto_sym("DOGE-USD"))
+        self.assertFalse(alerts.is_crypto_sym("TSLA"))
+        self.assertEqual(alerts.fp("DOGE-USD", 0.059856), "0.059856")
+        self.assertEqual(alerts.fp("BTC-USD", 64965.511), "64965.51")
+        self.assertEqual(alerts.fp("TSLA", 0.5), "0.50")
+
+    def test_yahoo_url_turns_a_slash_into_a_dash(self):
+        self.assertIn("/chart/BTC-USD?", alerts.yahoo_url("BTC/USD"))
+        self.assertIn("/chart/BRK-B?", alerts.yahoo_url("BRK.B"))
+
+    def test_stooq_refuses_crypto(self):
+        quotes, errors = alerts.get_quotes(["BTC-USD"], "stooq", pause=0)
+        self.assertEqual(quotes, {})
+        self.assertIn("no crypto", errors[0])
+
+    def test_rules_from_a_crypto_plan_have_no_flat_by_and_no_date(self):
+        rules = alerts.rules_from_plan(BTC_PLAN)
+        self.assertEqual([r["type"] for r in rules], ["stop", "target", "exit_by"])
+        for r in rules:
+            self.assertNotIn("date", r)
+            self.assertNotEqual(r["type"], "time")
+        self.assertEqual(rules[2]["at_utc"], "2026-11-18T03:30:00Z")
+        self.assertEqual(rules[0]["until"], "2026-11-18T03:30:00Z")
+        self.assertIn("sell by hand", rules[1]["note"])
+
+    def test_stock_plan_rules_unchanged(self):
+        with open(PLAN) as fh:
+            plan = json.load(fh)
+        self.assertEqual([r["type"] for r in alerts.rules_from_plan(plan)], ["stop", "target", "time"])
+
+    def test_stop_rings_on_a_night_the_nyse_is_closed(self):
+        rules = alerts.rules_from_plan(BTC_PLAN)
+        q = {"BTC-USD": {"price": 64500.12, "prev_close": None, "time": "", "source": "yahoo"}}
+        rings, st = alerts.evaluate(rules, q, self.status(), {}, self.NOW)
+        self.assertEqual([r["id"] for r in rings], ["btcusd-plan-stop"])
+        self.assertIn("is $64500.12", rings[0]["message"])          # "is", not "last": it trades now
+        rings, _ = alerts.evaluate(rules, q, self.status(), st, self.NOW)
+        self.assertEqual(rings, [])                                  # rings once
+
+    def test_sub_dollar_price_keeps_its_digits(self):
+        rule = {"id": "d", "symbol": "DOGE-USD", "type": "below", "price": 0.0598}
+        q = {"DOGE-USD": {"price": 0.059264, "prev_close": None, "time": "", "source": "yahoo"}}
+        rings, _ = alerts.evaluate([rule], q, self.status(), {}, self.NOW)
+        self.assertIn("$0.059264", rings[0]["message"])
+        self.assertIn("$0.0598", rings[0]["message"])
+
+    def test_exit_by_rings_once_after_its_time_across_midnight_utc(self):
+        rules = alerts.rules_from_plan(BTC_PLAN)
+        before, after = DT(2026, 11, 18, 3, 29), DT(2026, 11, 18, 3, 31)
+        rings, st = alerts.evaluate(rules, {}, self.status(before), {}, before)
+        self.assertEqual(rings, [])
+        rings, st = alerts.evaluate(rules, {}, self.status(after), st, after)
+        self.assertEqual([r["id"] for r in rings], ["btcusd-exit-by"])
+        self.assertIn("flatten --symbol BTC-USD", rings[0]["message"])
+        rings, _ = alerts.evaluate(rules, {}, self.status(after), st, after)
+        self.assertEqual(rings, [])
+
+    def test_until_retires_stop_and_target_after_exit_by(self):
+        rule = alerts.rules_from_plan(BTC_PLAN)[0]
+        self.assertTrue(alerts.active(rule, "2026-11-17", DT(2026, 11, 18, 3, 0)))
+        self.assertFalse(alerts.active(rule, "2026-11-17", DT(2026, 11, 18, 3, 31)))
+
+    def test_exit_by_needs_a_utc_time(self):
+        with self.assertRaises(alerts.AlertError):
+            alerts.validate({"id": "x", "type": "exit_by", "at_utc": "soon"})
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
