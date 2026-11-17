@@ -89,11 +89,17 @@ in and out before the close. No new 8-K." At 10:52 the price line reads
 `TSLA 366.48 +3.31% vs yesterday's close 354.72 at 10:52 ET  MOVING`. When a
 ticker has no news, say so rather than padding the brief.
 
-## Crypto
+## Crypto (24/7)
 
-This skill is for US stocks. It has no crypto path: a ticker like `BTC-USD`
-has no SEC filings, no earnings and no congressional trades, so say so and
-point to `/trader-scanner --asset crypto` and `/trader-entry` instead.
+Coins work here: `news.py --tickers BTC-USD ETH/USD` (a slash is fine, and a
+coin from `watchlist.json` or `plan.json` is picked up like a stock).
+
+- You get Yahoo headlines and the price line. The move is against the previous
+  close of the UTC day, and sub-dollar coins keep six decimals.
+- A coin has no SEC filings, so it is never looked up at EDGAR, and a run with
+  only coins does not need `sec_user_agent`.
+- Times still print in New York time, like every stock item. Coins trade
+  around the clock, so a headline can land at any hour.
 
 ## What it never does
 

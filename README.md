@@ -180,7 +180,8 @@ What is different from stocks:
 - **UTC, not New York.** No NYSE calendar, no open, no flat-by-close. A trade
   ends at `exit_by` instead.
 - **Fractional coins**, prices to six decimals under a dollar.
-- `/trader-news`, `/trader-analyst` and `/trader-pelosi` are stock-only.
+- `/trader-news` covers coins (headlines and price, no SEC filings).
+  `/trader-analyst` and `/trader-pelosi` are stock-only and say so.
 - Futures, commodities and options are not covered.
 
 ## Fine print

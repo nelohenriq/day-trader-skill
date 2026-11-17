@@ -118,6 +118,25 @@ def to_eastern(utc):
 
 # ---------------------------------------------------------------- inputs
 
+def is_crypto(ticker):
+    """BTC-USD, BTC/USD: a crypto pair. It has Yahoo headlines and a price, but no SEC filings."""
+    return bool(re.match(r"^[A-Z0-9]{2,10}[/-]USD[TC]?$", str(ticker).strip().upper()))
+
+
+def norm(ticker):
+    """One spelling per ticker: BTC/USD -> BTC-USD, everything else upper-cased."""
+    t = str(ticker).strip().upper()
+    return t.replace("/", "-") if is_crypto(t) else t
+
+
+def num(x, crypto):
+    """A price: cents, or six places under a dollar for a coin."""
+    x = float(x)
+    if crypto and abs(x) < 1:
+        return ("%.6f" % x).rstrip("0").rstrip(".")
+    return "{:,.2f}".format(x)
+
+
 def load_json(path):
     if path and os.path.isfile(path):
         with open(path, encoding="utf-8") as fh:
@@ -133,15 +152,15 @@ def watch_from_files(portfolio="trader/portfolio.json", watchlist="trader/watchl
     for h in wl.get("hits", []):
         sym = h.get("symbol") or h.get("ticker")
         if sym:
-            out[sym.upper()] = h.get("name")
+            out[norm(sym)] = h.get("name")
     pl = load_json(plan) or {}
     if pl.get("symbol"):
-        out.setdefault(pl["symbol"].upper(), pl.get("name"))
+        out.setdefault(norm(pl["symbol"]), pl.get("name"))
     pf = load_json(portfolio) or {}
     for p in pf.get("positions", []):
         sym = p.get("ticker") or p.get("symbol")
         if sym:
-            out[sym.upper()] = p.get("name") or out.get(sym.upper())
+            out[norm(sym)] = p.get("name") or out.get(norm(sym))
     return out
 
 
@@ -192,7 +211,7 @@ class Fetcher(object):
 
 
 def yahoo_symbol(ticker):
-    return ticker.upper().replace(".", "-")
+    return ticker.upper().replace(".", "-").replace("/", "-")
 
 
 def cik_map(fetcher, state):
@@ -300,7 +319,8 @@ def parse_chart(data, ticker):
     if not price or not prev:
         raise NewsError("chart for %s has no price" % ticker)
     when = meta.get("regularMarketTime")
-    return {"ticker": ticker, "price": round(float(price), 2), "prev_close": round(float(prev), 2),
+    nd = 6 if is_crypto(ticker) and float(price) < 1 else 2
+    return {"ticker": ticker, "price": round(float(price), nd), "prev_close": round(float(prev), nd),
             "pct": round((float(price) / float(prev) - 1) * 100, 2),
             "time": _dt.datetime.fromtimestamp(when, _dt.timezone.utc) if when else None}
 
@@ -393,6 +413,8 @@ def collect(fetcher, watch, state, sec=True, forms=("8-K",), count=10, errors=No
             errors.append("SEC ticker list: %s" % exc)
             ciks = {}
         for t in sorted(watch):
+            if is_crypto(t):
+                continue                # a coin has no filings: headlines and the price move only
             cik = ciks.get(t)
             if not cik:
                 if ciks:
@@ -440,9 +462,10 @@ def render_moves(moves, move_pct=MOVE_PCT):
     for m in moves:
         flag = "MOVING" if abs(m["pct"]) >= move_pct else ""
         when = (" at %s ET" % to_eastern(m["time"]).strftime("%H:%M")) if m.get("time") else ""
-        out.append("%-6s %s %+.2f%% vs yesterday's close %s%s  %s" % (
-            m["ticker"], "{:,.2f}".format(m["price"]), m["pct"], "{:,.2f}".format(m["prev_close"]),
-            when, flag))
+        c = is_crypto(m["ticker"])
+        out.append("%-6s %s %+.2f%% vs %s %s%s  %s" % (
+            m["ticker"], num(m["price"], c), m["pct"], "the previous close (UTC day)" if c else "yesterday's close",
+            num(m["prev_close"], c), when, flag))
     return out
 
 
@@ -500,7 +523,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.tickers:
-        watch = {t.upper(): None for t in args.tickers}
+        watch = {norm(t): None for t in args.tickers}
         known = watch_from_files(args.portfolio, args.watchlist, args.plan)
         watch.update({t: known[t] for t in watch if known.get(t)})
     else:
@@ -514,7 +537,9 @@ def main(argv=None):
     errors = []
     ua = sec_user_agent(args.user_agent, args.config)
     sec = not args.no_sec
-    if sec and not ua and not args.offline:
+    if sec and all(is_crypto(t) for t in watch):
+        sec = False                 # only coins: nothing to look up at SEC EDGAR
+    elif sec and not ua and not args.offline:
         errors.append("SEC filings skipped: set sec_user_agent in trader/config.json or "
                       "SEC_USER_AGENT (\"Your Name you@example.com\") to include them")
         sec = False

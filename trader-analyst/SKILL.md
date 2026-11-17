@@ -109,9 +109,9 @@ so the summary read that 10-Q directly.
 
 ## Crypto
 
-This skill is for US stocks. It has no crypto path: a ticker like `BTC-USD`
-has no SEC filings, no earnings and no congressional trades, so say so and
-point to `/trader-scanner --asset crypto` and `/trader-entry` instead.
+This skill is for US stocks. A coin like `BTC-USD` has no SEC filings,
+earnings or XBRL facts, so `facts.py` says so and exits instead of searching.
+Use `/trader-news` for a coin's headlines and `/trader-timemachine` for odds.
 
 ## What it never does
 

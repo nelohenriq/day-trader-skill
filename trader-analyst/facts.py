@@ -482,6 +482,14 @@ def main(argv=None):
     if not args.tickers and not args.cik:
         ap.print_help()
         return 2
+    if not args.cik:
+        coins = [t for t in args.tickers if re.match(r"^[A-Za-z0-9]{2,10}[/-]USD[TC]?$", t.strip())]
+        for t in coins:
+            print("facts: %s is a crypto pair: it has no SEC filings, earnings or XBRL facts. "
+                  "Use /trader-news for its headlines." % t.upper(), file=sys.stderr)
+        args.tickers = [t for t in args.tickers if t not in coins]
+        if coins and not args.tickers:
+            return 2
     ua = user_agent(args.user_agent, args.config)
     if not ua and not args.offline:
         print("facts: " + UA_HELP, file=sys.stderr)

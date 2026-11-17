@@ -134,9 +134,9 @@ does not click it or automate it. The route:
 
 ## Crypto
 
-This skill is for US stocks. It has no crypto path: a ticker like `BTC-USD`
-has no SEC filings, no earnings and no congressional trades, so say so and
-point to `/trader-scanner --asset crypto` and `/trader-entry` instead.
+Congress reports stocks, not coins: a periodic transaction report can list a
+crypto ETF or a miner's shares (those are stocks and work as usual), but
+there is no `BTC-USD` row to find. Do not use this skill as a signal for a coin.
 
 ## What it never does
 

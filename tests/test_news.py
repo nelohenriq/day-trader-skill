@@ -204,5 +204,33 @@ class Check(unittest.TestCase):
         self.assertEqual(state["last_check"], now.isoformat())
 
 
+class Crypto(unittest.TestCase):
+    def test_pairs_are_recognised_and_normalised(self):
+        self.assertTrue(news.is_crypto("btc/usd"))
+        self.assertTrue(news.is_crypto("DOGE-USD"))
+        self.assertFalse(news.is_crypto("TSLA"))
+        self.assertFalse(news.is_crypto("BRK-B"))
+        self.assertEqual(news.norm("btc/usd"), "BTC-USD")
+        self.assertEqual(news.yahoo_symbol("BTC/USD"), "BTC-USD")
+
+    def test_coin_price_keeps_its_digits(self):
+        doc = json.dumps({"chart": {"result": [{"meta": {"regularMarketPrice": 0.059216,
+                          "chartPreviousClose": 0.058868, "regularMarketTime": 1763340000}}]}})
+        m = news.parse_chart(doc, "DOGE-USD")
+        self.assertEqual(m["price"], 0.059216)
+        self.assertIn("0.059216", news.render_moves([m])[0])
+        self.assertIn("UTC day", news.render_moves([m])[0])
+
+    def test_a_coin_is_never_looked_up_at_the_sec(self):
+        class F:
+            offline = True
+            def get(self, url, name, sec=False):
+                assert "sec.gov" not in url, url
+                raise news.NewsError("no file")
+        errors = []
+        news.collect(F(), {"BTC-USD": None}, {"ciks": {"AAPL": "1"}}, sec=True, errors=errors)
+        self.assertFalse([e for e in errors if "SEC" in e and "BTC" in e])
+
+
 if __name__ == "__main__":
     unittest.main()
