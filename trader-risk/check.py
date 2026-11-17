@@ -641,6 +641,11 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                         # for stop x keep x keep, so the real loss is a little bigger than ref - stop
                         keep = 1 - (_f(c.get("crypto_fee_pct")) or 0) / 100.0
                         max_loss = round(shares * (ref - stop * keep * keep), 2)
+                        fee_share = (max_loss / (shares * risk_ps) - 1) if shares and risk_ps else 0
+                        if fee_share >= 0.25:
+                            warns.append("fees: Alpaca's %s %% fee on both fills is %.0f %% of the risk to the stop "
+                                         "(the max loss above already includes it): the stop is close enough that "
+                                         "fees decide the trade" % (_num(c.get("crypto_fee_pct") or 0), 100 * fee_share))
                     cap = _f(c.get("max_loss_per_trade_usd"))
                     if cap and max_loss > cap + CENT:
                         later.append("loss: %s %s x %s risk a %s = %s at the stop, over your %s max loss "

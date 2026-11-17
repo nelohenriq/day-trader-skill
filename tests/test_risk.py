@@ -376,6 +376,12 @@ class CryptoChecks(unittest.TestCase):
         self.assertAlmostEqual(r["max_loss"], 0.0577 * (64983.22 - 64624.55 * 0.9975 ** 2), places=2)   # fees included
         self.assertTrue(any("AFTER the entry fills" in w for w in r["warnings"]))
 
+    def test_close_stop_warns_that_fees_decide_the_trade(self):
+        r = self.run_one(crypto_order())
+        self.assertTrue(any(w.startswith("fees:") for w in r["warnings"]), r["warnings"])
+        r = self.run_one(crypto_order(), crypto_fee_pct=0)
+        self.assertFalse(any(w.startswith("fees:") for w in r["warnings"]))
+
     def test_the_fee_can_push_a_loss_over_the_cap(self):
         # 0.0577 BTC risks $20.70 before fees and $39.32 with them: a $30 cap blocks it, 0 % fee does not
         r = self.run_one(crypto_order(), max_loss_per_trade_usd=30)

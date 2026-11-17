@@ -306,6 +306,7 @@ def money(x):
 # ---------------------------------------------------------------- crypto (fractional, 24/7, no bracket orders)
 
 CRYPTO_QTY_STEP = Decimal("0.000000001")   # Alpaca takes coin quantities to 9 decimals
+FEE_WARN_SHARE = 0.25                      # warn when fees are this share of the risk to the stop
 STOP_LIMIT_GAP = Decimal("0.005")          # the stop-loss's limit sits 0.5% under its stop so it can fill
 
 
@@ -419,6 +420,8 @@ def size_crypto(plan, cfg, budget=None, limit=None, price=None, cash=None, today
     cost = float((qty * _d(ref)).quantize(Decimal("0.01")))
     loss = float((qty * loss_per_coin).quantize(Decimal("0.01")))
     net_qty = (qty * keep).quantize(CRYPTO_QTY_STEP, rounding=ROUND_FLOOR)
+    fee_usd = float(qty * (loss_per_coin - risk))          # both fees, in dollars, inside the max loss
+    fee_share = float((loss_per_coin - risk) / risk) if risk > 0 else 0.0
     rr = float((reward / risk).quantize(Decimal("0.01")))
     refusal = None
     if qty == 0:
@@ -438,7 +441,7 @@ def size_crypto(plan, cfg, budget=None, limit=None, price=None, cash=None, today
         "budget": budget, "cash_buffer_pct": buf_pct, "cash_buffer": cash_buffer, "cash_available": available,
         "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
         "cost": cost, "max_loss": loss, "flat_by": None, "exit_by": plan.get("exit_by"), "price_step": step,
-        "fee_pct": fee_pct, "net_qty": net_qty,
+        "fee_pct": fee_pct, "net_qty": net_qty, "fee_usd": round(fee_usd, 2), "fee_share": round(fee_share, 3),
         "order_type": "limit" if limit is not None else "market", "refusal": refusal,
     }
 
@@ -494,6 +497,10 @@ def crypto_report(s, order, notes=()):
         order["qty"], s["symbol"], money(s["cost"]), cmoney(s["entry"]), money(s["max_loss"])))
     lines.append("Fees: Alpaca takes %s%% of each fill, so the buy leaves you %s coins and the stop sells those. "
                  "The max loss above includes both fees." % (_num(s["fee_pct"]), format(s["net_qty"].normalize(), "f")))
+    if s["fee_share"] >= FEE_WARN_SHARE:
+        lines.append("WARNING: fees are %s of the %s you are risking (%.0f%% of the risk): the stop is so close that the "
+                     "fees decide this trade. A wider stop or a bigger target makes the fee matter less."
+                     % (money(s["fee_usd"]), money(s["max_loss"]), 100 * s["fee_share"]))
     lines.append("A stop is an order, not a promise: crypto never halts, and a fast move can fill below %s." % cmoney(s["stop"]))
     lines += ["", "Proposed orders (place_crypto_order arguments, nothing has been placed):"]
     how = "limit %s" % order["limit_price"] if order["type"] == "limit" else "market"

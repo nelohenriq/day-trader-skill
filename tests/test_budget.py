@@ -304,6 +304,14 @@ class Crypto(unittest.TestCase):
         self.assertLess(with_fee["qty"], no_fee["qty"])
         self.assertEqual(no_fee["net_qty"], no_fee["qty"])
 
+    def test_fee_warning_when_the_stop_is_close(self):
+        s = self.size()                      # the plan's stop is 0.55 % away: fees are about 90 % of the risk
+        self.assertGreaterEqual(s["fee_share"], 0.25)
+        self.assertIn("WARNING: fees are", size.plan_report(s, size.bracket_order(s)))
+        wide = self.size(dict(BTC_PLAN, stop=60000.0))
+        self.assertLess(wide["fee_share"], 0.25)
+        self.assertNotIn("WARNING: fees", size.plan_report(wide, size.bracket_order(wide)))
+
     def test_a_silly_fee_is_refused(self):
         with self.assertRaises(size.SizeError):
             self.size(cfg={"crypto_fee_pct": 9})

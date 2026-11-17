@@ -168,6 +168,8 @@ the max-loss limit uses the real loss per coin (the entry less the stop times
 the coins you keep, twice), the stop-loss is sized to the coins you will hold,
 and the max loss shown includes both fees. A 0.55% stop costs about 0.5% more
 in fees, so a tight stop is mostly fee. Set `crypto_fee_pct` to your tier.
+When fees are a quarter or more of the risk to the stop, the report prints a
+WARNING, and `/trader-risk` adds a "fees:" warning. It warns, it does not block.
 
 ## Rules
 
