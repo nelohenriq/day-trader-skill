@@ -242,6 +242,95 @@ class PlanRules(unittest.TestCase):
         self.assertNotIn("Traceback", err)
 
 
+BTC_PLAN = {"created_by": "trader-exit", "asset": "crypto", "timezone": "UTC", "symbol": "BTC-USD", "side": "buy",
+            "date": "2026-11-17", "setup": "orb", "entry": 64983.22, "entry_time": "03:30 UTC", "stop": 64624.55,
+            "target": 65521.23, "risk_per_share": 358.67, "reward_risk": 1.5, "flat_by": None, "price_step": "0.01",
+            "exit_by": "2026-11-18T03:30:00Z", "stop_label": "opening-range midpoint", "target_label": "1.5R"}
+DOGE_PLAN = dict(BTC_PLAN, symbol="DOGE-USD", entry=0.062, stop=0.06025, target=0.0655, risk_per_share=0.00175,
+                 price_step="0.000001", reward_risk=2.0)
+CRYPTO_CFG = {"budget": 5000, "max_loss_per_trade_usd": 50, "allow_crypto": True}
+
+
+class Crypto(unittest.TestCase):
+    def size(self, plan=BTC_PLAN, **kw):
+        return size.size_trade(plan, dict(CRYPTO_CFG, **kw.pop("cfg", {})), today=kw.pop("today", "2026-11-17"), **kw)
+
+    def test_pair_and_price_helpers(self):
+        self.assertEqual(size.crypto_pair("BTC-USD"), "BTC/USD")
+        self.assertEqual(size.crypto_pair("eth"), "ETH/USD")
+        self.assertEqual(size.cprice(64624.555, "0.01"), "64624.56")
+        self.assertEqual(size.cprice(0.06025, "0.000001"), "0.060250")
+
+    def test_fractional_btc_binds_on_position_cap(self):
+        s = self.size()
+        self.assertEqual(s["asset"], "crypto")
+        self.assertEqual(s["bound_by"], "position cap")
+        self.assertEqual(str(s["qty"]), "0.057707205")        # 3750 / 64983.22 rounded DOWN
+        self.assertLessEqual(s["max_loss"], 50)
+
+    def test_max_loss_binds_when_the_stop_is_wide(self):
+        s = self.size(cfg={"budget": 100000, "max_position_pct": 100, "max_order_usd": 1000000, "cash_buffer_pct": 0})
+        self.assertEqual(s["bound_by"], "max loss")
+        self.assertLessEqual(s["max_loss"], 50.0)
+        self.assertGreater(s["max_loss"], 49.99)
+
+    def test_qty_rounds_down_never_up(self):
+        q = size.coin_qty(100, 3)
+        self.assertEqual(str(q), "33.333333333")
+
+    def test_order_has_no_bracket_and_a_separate_stop(self):
+        o = size.bracket_order(self.size())
+        self.assertEqual((o["symbol"], o["type"], o["time_in_force"], o["order_class"]), ("BTC/USD", "market", "gtc", "simple"))
+        self.assertNotIn("take_profit_limit_price", o)
+        sl = o["after_fill"]["stop_loss"]
+        self.assertEqual((sl["side"], sl["type"], sl["stop_price"], sl["qty"]), ("sell", "stop_limit", "64624.55", o["qty"]))
+        self.assertLess(float(sl["limit_price"]), float(sl["stop_price"]))
+        self.assertEqual(o["after_fill"]["take_profit"]["how"], "alert")
+        self.assertEqual(o["after_fill"]["exit_by"], "2026-11-18T03:30:00Z")
+
+    def test_sub_dollar_coin(self):
+        s = self.size(DOGE_PLAN, cfg={"max_position_pct": 100, "max_order_usd": 100000, "cash_buffer_pct": 0})
+        o = size.bracket_order(s)
+        self.assertEqual(o["symbol"], "DOGE/USD")
+        self.assertEqual(o["after_fill"]["stop_loss"]["stop_price"], "0.060250")
+        self.assertLessEqual(s["max_loss"], 50.0)
+
+    def test_limit_order_carries_a_limit_price(self):
+        o = size.bracket_order(self.size(limit=64900.0))
+        self.assertEqual((o["type"], o["limit_price"]), ("limit", "64900.00"))
+
+    def test_plan_for_another_utc_day_is_refused(self):
+        with self.assertRaises(size.SizeError):
+            self.size(today="2026-11-18")
+
+    def test_refuses_without_a_stop_under_the_entry(self):
+        with self.assertRaises(size.SizeError):
+            self.size(dict(BTC_PLAN, stop=65000.0))
+
+    def test_json_output_serialises(self):
+        d = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        os.chdir(d)
+        try:
+            os.mkdir("trader")
+            with open("trader/plan.json", "w") as fh:
+                json.dump(BTC_PLAN, fh)
+            with open("trader/config.json", "w") as fh:
+                json.dump(CRYPTO_CFG, fh)
+            code, text, err = run(["--now", "2026-11-17 00:20", "--json"])
+            self.assertEqual(code, 0, err)
+            self.assertEqual(json.loads(text)["orders"][0]["symbol"], "BTC/USD")
+        finally:
+            os.chdir(cwd)
+
+    def test_stock_plan_is_untouched(self):
+        s = size.size_trade({"symbol": "TSLA", "side": "buy", "entry": 364.18, "stop": 358.32, "target": 370.04,
+                             "date": "2026-10-19"}, {"budget": 5000, "max_loss_per_trade_usd": 50},
+                            today="2026-10-19")
+        self.assertEqual(s["qty"], 8)
+        self.assertNotIn("asset", s)
+
+
 class WeightsMode(unittest.TestCase):
     """v1's split, kept behind --weights / --targets: $5,000, 10% cash, 25% cap."""
 

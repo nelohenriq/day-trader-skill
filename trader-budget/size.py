@@ -57,6 +57,7 @@ import json
 import math
 import os
 import sys
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
 # v2 defaults: the contract's config.example.json. Missing keys fall back to these.
 DEFAULTS = {
@@ -79,6 +80,7 @@ DEFAULTS = {
     "paper": True,
     "blocked": [],
     "allow_options": False,
+    "allow_crypto": False,
     "allow_margin": False,
     "allow_short": False,
     "pdt_guard": False,
@@ -300,6 +302,201 @@ def money(x):
     return "$" + "{:,.2f}".format(x)
 
 
+# ---------------------------------------------------------------- crypto (fractional, 24/7, no bracket orders)
+
+CRYPTO_QTY_STEP = Decimal("0.000000001")   # Alpaca takes coin quantities to 9 decimals
+STOP_LIMIT_GAP = Decimal("0.005")          # the stop-loss's limit sits 0.5% under its stop so it can fill
+
+
+def _d(x):
+    return Decimal(repr(x)) if isinstance(x, float) else Decimal(str(x))
+
+
+def crypto_pair(sym):
+    """BTC-USD -> BTC/USD, the form Alpaca's crypto orders take."""
+    sym = str(sym).upper()
+    return sym.replace("-", "/") if "-" in sym else sym + "/USD"
+
+
+def cprice(x, step):
+    """A crypto price as a string on its price step: "64624.55", "0.060250"."""
+    q = _d(step)
+    return format(_d(x).quantize(q, rounding=ROUND_HALF_UP), "f")
+
+
+def cmoney(x):
+    d = _d(x)
+    if abs(d) >= 1:
+        return "$" + "{:,.2f}".format(d)
+    return "$" + format(d.quantize(Decimal("0.000001")), "f").rstrip("0").rstrip(".")
+
+
+def coin_qty(usd, per_coin):
+    """Coins that fit in usd at per_coin, rounded DOWN to 9 decimals."""
+    usd, per = _d(usd), _d(per_coin)
+    if per <= 0 or usd <= 0:
+        return Decimal(0)
+    return (usd / per).quantize(CRYPTO_QTY_STEP, rounding=ROUND_FLOOR)
+
+
+def size_crypto(plan, cfg, budget=None, limit=None, price=None, cash=None, today=None):
+    """The crypto twin of size_trade: fractional coins, UTC date, one entry order plus the stop-loss to
+    place after the fill (Alpaca crypto has no bracket orders and no day orders)."""
+    c = dict(DEFAULTS)
+    c.update(cfg or {})
+    sym = str(plan.get("symbol") or "").strip().upper()
+    if not sym:
+        raise SizeError("the plan has no symbol (run trader-exit)")
+    if str(plan.get("side") or "buy").lower() != "buy":
+        raise SizeError("this pack sizes long (buy) trades only; crypto cannot be sold short")
+    if today and plan.get("date") and str(plan["date"]) != today:
+        raise SizeError("the plan is for %s and today is %s UTC: make a new plan with trader-exit"
+                        % (plan["date"], today))
+    entry_plan, stop, target = _f(plan.get("entry")), _f(plan.get("stop")), _f(plan.get("target"))
+    for name, v in (("entry", entry_plan), ("stop", stop), ("target", target)):
+        if v is None or v <= 0:
+            raise SizeError("the plan needs a positive %s (run trader-exit)" % name)
+    if sym in {str(b).upper() for b in (c.get("blocked") or [])}:
+        raise SizeError("%s is on your blocked list" % sym)
+    budget = float(budget if budget is not None else (c.get("budget") or 0))
+    if budget <= 0:
+        raise SizeError("no budget: pass --budget or set \"budget\" in trader/config.json")
+    buf_pct = float(c.get("cash_buffer_pct") or 0)
+    if not 0 <= buf_pct < 100:
+        raise SizeError("cash_buffer_pct must be between 0 and 100")
+    step = plan.get("price_step") or "0.01"
+
+    if limit is not None:
+        ref, ref_from = limit, "limit"
+    elif price is not None and price > entry_plan:
+        ref, ref_from = price, "price"
+    else:
+        ref, ref_from = entry_plan, "plan"
+    if stop >= ref:
+        raise SizeError("the stop %s is not below the entry %s; a long trade needs its stop underneath"
+                        % (cmoney(stop), cmoney(ref)))
+    if target <= ref:
+        raise SizeError("the target %s is not above the entry %s: the move has already happened. "
+                        "Skip it or make a new plan with trader-exit" % (cmoney(target), cmoney(ref)))
+    risk, reward = _d(ref) - _d(stop), _d(target) - _d(ref)
+
+    cash_buffer = round(budget * buf_pct / 100.0, 2)
+    available = budget - cash_buffer
+    cash_note = "budget %s minus the %s cash buffer" % (money(budget), money(cash_buffer))
+    if cash is not None and cash - cash_buffer < available - 0.005:
+        available = cash - cash_buffer
+        cash_note = "cash %s in trader/portfolio.json minus the %s buffer" % (money(cash), money(cash_buffer))
+    available = max(round(available, 2), 0.0)
+
+    limits = []
+    max_loss = _f(c.get("max_loss_per_trade_usd"))
+    if max_loss:
+        limits.append({"name": "max loss", "usd": max_loss, "per": float(risk), "shares": coin_qty(max_loss, risk),
+                       "how": "%s max loss / %s risk a coin" % (money(max_loss), cmoney(risk))})
+    cap_pct = _f(c.get("max_position_pct"))
+    if cap_pct:
+        cap = round(budget * cap_pct / 100.0, 2)
+        limits.append({"name": "position cap", "usd": cap, "per": ref, "shares": coin_qty(cap, ref),
+                       "how": "%s%% of %s = %s / %s" % (_num(cap_pct), money(budget), money(cap), cmoney(ref))})
+    max_order = _f(c.get("max_order_usd"))
+    if max_order:
+        limits.append({"name": "max order", "usd": max_order, "per": ref, "shares": coin_qty(max_order, ref),
+                       "how": "%s / %s" % (money(max_order), cmoney(ref))})
+    limits.append({"name": "cash", "usd": available, "per": ref, "shares": coin_qty(available, ref),
+                   "how": "%s = %s / %s" % (cash_note, money(available), cmoney(ref))})
+    qty = max(Decimal(0), min(l["shares"] for l in limits))
+    bound = [l["name"] for l in limits if l["shares"] == qty]
+    for l in limits:
+        l["binds"] = l["name"] == bound[0]
+    cost = float((qty * _d(ref)).quantize(Decimal("0.01")))
+    loss = float((qty * risk).quantize(Decimal("0.01")))
+    rr = float((reward / risk).quantize(Decimal("0.01")))
+    refusal = None
+    if qty == 0:
+        refusal = ("no coins fit: the smallest limit (%s) allows less than 0.000000001 of %s. No order."
+                   % (bound[0], sym))
+    elif _f(c.get("min_reward_risk")) and float(reward) < _f(c["min_reward_risk"]) * float(risk) - EPS:
+        refusal = ("reward:risk %.2f is under your minimum %s, so trader-risk would block it. No order."
+                   % (float(reward / risk), _num(c["min_reward_risk"])))
+    elif cost < float(c.get("min_order_usd") or 0) - 0.005:
+        refusal = "%s of %s is %s, under your %s minimum order. No order." % (
+            format(qty.normalize(), "f"), sym, money(cost), money(c["min_order_usd"]))
+    return {
+        "asset": "crypto", "symbol": sym, "side": "buy", "setup": plan.get("setup", ""), "date": plan.get("date"),
+        "entry_time": plan.get("entry_time", ""), "entry_plan": entry_plan, "entry": ref, "entry_from": ref_from,
+        "stop": stop, "target": target, "risk_per_share": float(risk), "reward_risk": rr,
+        "stop_label": plan.get("stop_label", ""), "target_label": plan.get("target_label", ""),
+        "budget": budget, "cash_buffer_pct": buf_pct, "cash_buffer": cash_buffer, "cash_available": available,
+        "max_loss_per_trade_usd": max_loss, "limits": limits, "qty": qty, "bound_by": bound[0],
+        "cost": cost, "max_loss": loss, "flat_by": None, "exit_by": plan.get("exit_by"), "price_step": step,
+        "order_type": "limit" if limit is not None else "market", "refusal": refusal,
+    }
+
+
+def crypto_order(s):
+    """The proposed entry order (place_crypto_order fields, strings), the stop-loss to place after the
+    fill, and the target as an alert. Alpaca crypto has no bracket orders: two resting sells on the same
+    coins would collide, so only the stop rests at the broker."""
+    if s["refusal"] or s["qty"] <= 0:
+        return None
+    step = s["price_step"]
+    qty = format(s["qty"].normalize(), "f")
+    o = {"asset": "crypto", "symbol": crypto_pair(s["symbol"]), "side": "buy", "qty": qty, "type": s["order_type"],
+         "time_in_force": "gtc", "order_class": "simple"}
+    if s["order_type"] == "limit":
+        o["limit_price"] = cprice(s["entry"], step)
+    stop_limit = _d(s["stop"]) * (1 - STOP_LIMIT_GAP)
+    o["after_fill"] = {
+        "stop_loss": {"symbol": o["symbol"], "side": "sell", "qty": qty, "type": "stop_limit", "time_in_force": "gtc",
+                      "stop_price": cprice(s["stop"], step), "limit_price": cprice(stop_limit, step)},
+        "take_profit": {"how": "alert", "price": cprice(s["target"], step),
+                        "why": "a second resting sell would lock the same coins; ring an alert and sell by hand"},
+        "exit_by": s.get("exit_by"),
+    }
+    setup = SETUP_WORDS.get(s["setup"], s["setup"] or "trade")
+    o["why"] = "%s on %s: %s coins, bound by your %s (%s at the stop)" % (
+        setup, s["symbol"], qty, s["bound_by"], money(s["max_loss"]))
+    o["plan"] = {"entry": s["entry"], "stop": s["stop"], "target": s["target"], "risk_per_share": s["risk_per_share"],
+                 "max_loss": s["max_loss"], "setup": s["setup"], "entry_time": s["entry_time"], "flat_by": None,
+                 "exit_by": s.get("exit_by")}
+    return o
+
+
+def crypto_report(s, order, notes=()):
+    step = s["price_step"]
+    lines = ["%s buy, %s, entry %s%s" % (s["symbol"], SETUP_WORDS.get(s["setup"], s["setup"] or "setup"),
+                                         cmoney(s["entry_plan"]), (" at " + s["entry_time"]) if s["entry_time"] else ""),
+             "Stop %s%s. Target %s%s." % (cmoney(s["stop"]), (": " + s["stop_label"]) if s["stop_label"] else "",
+                                           cmoney(s["target"]), (": " + s["target_label"]) if s["target_label"] else "")]
+    lines += list(notes)
+    lines.append("Sized at %s. Risk %s a coin. Reward:risk %.2f." % (cmoney(s["entry"]), cmoney(s["risk_per_share"]),
+                                                                   s["reward_risk"]))
+    lines += ["", "Limits (fractional coins; the smallest one wins):"]
+    for l in s["limits"]:
+        lines.append("  %-13s %-58s %s coins%s" % (l["name"], l["how"], format(l["shares"].normalize(), "f"),
+                                                    "  <- binds" if l["binds"] else ""))
+    lines.append("")
+    if order is None:
+        lines += ["No order: " + s["refusal"], "Education and tooling, not financial advice."]
+        return "\n".join(lines)
+    lines.append("Size: %s %s = %s at %s. Max loss at the stop: %s." % (
+        order["qty"], s["symbol"], money(s["cost"]), cmoney(s["entry"]), money(s["max_loss"])))
+    lines.append("A stop is an order, not a promise: crypto never halts, and a fast move can fill below %s." % cmoney(s["stop"]))
+    lines += ["", "Proposed orders (place_crypto_order arguments, nothing has been placed):"]
+    how = "limit %s" % order["limit_price"] if order["type"] == "limit" else "market"
+    lines.append("  1. buy %s %s, %s, gtc" % (order["qty"], order["symbol"], how))
+    sl = order["after_fill"]["stop_loss"]
+    lines.append("  2. after the fill: sell %s %s, stop-limit, stop %s, limit %s, gtc" % (
+        sl["qty"], sl["symbol"], sl["stop_price"], sl["limit_price"]))
+    lines.append("  Target %s: no resting order (it would lock the same coins). trader-alerts rings; you sell by hand."
+                 % order["after_fill"]["take_profit"]["price"])
+    if s.get("exit_by"):
+        lines.append("Exit by %s UTC, win or lose: cancel the stop and sell." % s["exit_by"].replace("T", " ")[:16])
+    lines += ["", "Next: trader-risk checks it, then trader-broker asks you yes or no.",
+              "Education and tooling, not financial advice."]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- plan mode (the default)
 
 def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=None):
@@ -313,6 +510,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     c.update(cfg or {})
     if not isinstance(plan, dict):
         raise SizeError("the plan is not a JSON object")
+    if plan.get("asset") == "crypto":
+        return size_crypto(plan, cfg, budget, limit, price, cash, today)
     sym = str(plan.get("symbol") or "").strip().upper()
     if not sym:
         raise SizeError("the plan has no symbol (run trader-exit)")
@@ -417,6 +616,8 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
 
 def bracket_order(s):
     """The one proposed order, Alpaca place_stock_order fields (strings) plus why and plan."""
+    if s.get("asset") == "crypto":
+        return crypto_order(s)
     if s["refusal"] or s["qty"] <= 0:
         return None
     o = {"symbol": s["symbol"], "side": "buy", "qty": str(int(s["qty"])), "type": s["order_type"],
@@ -442,6 +643,8 @@ def bracket_order(s):
 
 
 def plan_report(s, order, notes=()):
+    if s.get("asset") == "crypto":
+        return crypto_report(s, order, notes)
     lines = []
     setup = SETUP_WORDS.get(s["setup"], s["setup"] or "setup")
     lines.append("%s buy, %s, entry %s%s" % (s["symbol"], setup, _price(s["entry_plan"]),
@@ -774,8 +977,9 @@ def write_orders(path, orders, cfg, source="", now_utc=None):
 
 def run_plan(a, cfg):
     now = parse_now(a.now)
-    today = to_eastern(now).date().isoformat()
     plan = read_json(a.plan, "plan (run trader-exit first, or use --weights for a split)")
+    crypto = isinstance(plan, dict) and plan.get("asset") == "crypto"
+    today = now.date().isoformat() if crypto else to_eastern(now).date().isoformat()
     limit = None
     if a.limit is not None:
         if a.limit == "plan":
@@ -792,7 +996,11 @@ def run_plan(a, cfg):
         p, t, fresh = fresh_price(pdoc, sym, now)
         if p is not None and fresh:
             price = p
-            if round_cent(p) > round_cent(_f(plan.get("entry")) or 0):
+            if crypto:
+                if p > (_f(plan.get("entry")) or 0):
+                    notes.append("%s last %s (as of %s UTC) is above the plan's entry %s, so the risk is bigger: "
+                                 "sized at %s." % (sym, cmoney(p), t.strftime("%H:%M"), cmoney(plan.get("entry")), cmoney(p)))
+            elif round_cent(p) > round_cent(_f(plan.get("entry")) or 0):
                 notes.append("%s last %s (as of %s New York) is above the plan's entry %s, so the risk "
                              "is bigger: sized at %s." % (sym, _price(p), to_eastern(t).strftime("%H:%M"),
                                                           _price(plan.get("entry")), _price(p)))
@@ -810,11 +1018,13 @@ def run_plan(a, cfg):
         src = "trader/plan.json (%s %s %s)" % (s["symbol"], s["setup"] or "plan", s["date"] or today)
         write_orders(a.write, [order], cfg, src, now)
     if a.json:
-        print(json.dumps({"sizing": s, "orders": [order] if order else [], "notes": notes}, indent=2))
+        print(json.dumps({"sizing": s, "orders": [order] if order else [], "notes": notes}, indent=2,
+                         default=lambda o: format(o.normalize(), "f") if isinstance(o, Decimal) else str(o)))
     else:
         print(plan_report(s, order, notes))
         if order and a.write:
-            print("Wrote 1 proposed bracket order to %s" % a.write)
+            print("Wrote 1 proposed %s to %s" % ("crypto entry order (with its stop-loss)" if s.get("asset") == "crypto"
+                                              else "bracket order", a.write))
     return 0 if order else 1
 
 
