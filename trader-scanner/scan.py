@@ -91,6 +91,12 @@ BAR_MIN = 5
 MAX_CONFIRM = 200   # stage-2 v8 charts per orb scan, most traded first
 MIN_DAILY_BARS = 30
 DEFAULT_UNIVERSE = "trader/universe.txt"
+# Crypto trades 24/7: no NYSE calendar, no open. The daily bar is a UTC day, complete at 00:00 UTC.
+CRYPTO_UNIVERSE = [
+    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD", "ADA-USD", "AVAX-USD", "LINK-USD",
+    "DOT-USD", "LTC-USD", "BCH-USD", "UNI-USD", "AAVE-USD", "XLM-USD", "ATOM-USD", "NEAR-USD",
+    "ETC-USD", "FIL-USD", "ALGO-USD", "HBAR-USD",
+]
 NOTE = "A scan is a list of charts that match a rule, not a list of stocks to buy."
 
 NYSE_HOLIDAYS = {
@@ -495,18 +501,25 @@ def rsi(closes, n=14):
     return 100 - 100 / (1 + ag / al) if al else 100.0
 
 
-def daily_closes(series, now_utc):
+def daily_closes(series, now_utc, crypto=False):
     """[(date, close)] of COMPLETE daily bars: null closes dropped, today's bar dropped
-    until the session closes, anything dated after the clock dropped."""
-    now = to_eastern(now_utc)
-    today = now.date()
-    s = session(today)
-    today_done = s is None or now.time() >= s[1]
+    until the session closes, anything dated after the clock dropped.
+    crypto=True: bars are UTC days, so today's bar is never complete until tomorrow."""
+    if crypto:
+        today, today_done = now_utc.date(), False
+    else:
+        now = to_eastern(now_utc)
+        today = now.date()
+        s = session(today)
+        today_done = s is None or now.time() >= s[1]
     out = {}
     for ts, c in zip(series["t"], series["c"]):
         if c is None:
             continue
-        d = ts_to_eastern(ts).date()
+        if crypto:
+            d = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).date()
+        else:
+            d = ts_to_eastern(ts).date()
         if d > today or (d == today and not today_done):
             continue
         out[d] = float(c)  # one bar a day: a late duplicate (the live tick) wins
@@ -539,7 +552,7 @@ def find_setups(closes):
                   "run_pct": run * 100, "range5_pct": rng5 * 100}
 
 
-def scan_daily(data, symbols, now_utc, min_price, min_volume):
+def scan_daily(data, symbols, now_utc, min_price, min_volume, crypto=False):
     """Pure. data = {SYM: series}. Returns (hits, counts, last_date)."""
     hits, dates = [], {}
     counts = {"requested": len(symbols), "fetched": 0, "illiquid": 0, "short": 0, "scanned": 0}
@@ -548,7 +561,7 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
         if not s:
             continue
         counts["fetched"] += 1
-        bars = daily_closes(s, now_utc)
+        bars = daily_closes(s, now_utc, crypto)
         meta = s.get("meta") or {}
         price = meta.get("regularMarketPrice")
         if price is None and bars:
@@ -566,7 +579,7 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
         closes = [c for _, c in bars]
         tags, nums = find_setups(closes)
         if tags:
-            hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 2),
+            hits.append({"symbol": sym, "setups": tags, "price": round(closes[-1], 6 if crypto and closes[-1] < 1 else 2),
                          "close_date": d_last.isoformat(), "rsi": round(nums["rsi"], 1),
                          "volume": int(vol) if vol is not None else None})
     hits.sort(key=lambda h: (-(h["price"] * (h["volume"] or 0)), h["symbol"]))  # most dollars traded first
@@ -773,6 +786,8 @@ def read_symbols(a, offline_syms=None):
         syms = [s for s in re.split(r"[,\s]+", a.symbols.upper()) if s]
     elif a.watchlist:
         syms = symbols_from_file(a.watchlist)
+    elif getattr(a, "asset", "stock") == "crypto" and not a.universe:
+        syms = list(CRYPTO_UNIVERSE)
     elif offline_syms is not None and not a.universe:
         syms = sorted(offline_syms)  # offline: every chart in the file, unless a list was given
     else:
@@ -832,6 +847,8 @@ def write_json(path, doc):
 
 
 def money(x):
+    if 0 < abs(x) < 1:
+        return "${:.6f}".format(x).rstrip("0").rstrip(".")  # sub-dollar coins keep their digits
     return "${:,.2f}".format(x)
 
 
@@ -883,6 +900,11 @@ def cmd_universe(a):
 def cmd_daily(a):
     t0 = time.time()
     now = parse_now(a.now)
+    crypto = a.asset == "crypto"
+    if a.min_price is None:
+        a.min_price = 0.0 if crypto else 5.0
+    if a.min_volume is None:
+        a.min_volume = 0 if crypto else 1000000
     offline_syms = None
     if a.offline:
         data, failed = load_offline(a.offline)
@@ -892,10 +914,10 @@ def cmd_daily(a):
         progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
                  % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
         data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a)
-    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume)
+    hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume, crypto)
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
-    doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
+    doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily", "asset": a.asset,
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
            "source": "yahoo", "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE, "hits": hits}
@@ -907,13 +929,15 @@ def cmd_daily(a):
         print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
         return 0 if hits else 1
     local = to_eastern(now)
-    print("Daily scan, %s ET, closes through %s (Yahoo spark, daily closes only)." % (
-        local.strftime("%a %Y-%m-%d %H:%M"), last_date.isoformat() if last_date else "nothing"))
-    print("Fetched %s of %s charts%s. %s passed the liquidity filter ($%s+ and %s+ shares)%s; "
+    print("Daily scan%s, %s ET, closes through %s%s (Yahoo spark, daily closes only)." % (
+        " (crypto, 24/7)" if crypto else "",
+        local.strftime("%a %Y-%m-%d %H:%M"), last_date.isoformat() if last_date else "nothing",
+        " UTC" if crypto else ""))
+    print("Fetched %s of %s charts%s. %s passed the liquidity filter ($%s+ and %s+ %s)%s; "
           "%s scanned." % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
                            (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
                            "{:,}".format(counts["fetched"] - counts["illiquid"]), _n(a.min_price),
-                           "{:,}".format(a.min_volume),
+                           "{:,}".format(a.min_volume), "units" if crypto else "shares",
                            (", %d had under %d days" % (counts["short"], MIN_DAILY_BARS)) if counts["short"] else "",
                            "{:,}".format(counts["scanned"])))
     if hits:
@@ -1056,8 +1080,11 @@ def main(argv=None):
         p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("daily", help="pre-market setups from daily closes")
-    common(p, 5.0, 1000000)
-    p = sub.add_parser("orb", help="opening-range breakouts so far today")
+    common(p, None, None)
+    p.add_argument("--asset", choices=("stock", "crypto"), default="stock",
+                   help="stock (default: the Nasdaq universe) or crypto (24/7, UTC daily bars, a built-in list of "
+                        "major -USD pairs unless --symbols/--universe is given)")
+    p = sub.add_parser("orb", help="opening-range breakouts so far today (stocks only: crypto has no open)")
     common(p, 5.0, 0)
     p.add_argument("--or-minutes", type=int, default=15)
     p.add_argument("--max-confirm", type=int, default=MAX_CONFIRM,

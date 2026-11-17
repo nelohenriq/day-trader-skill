@@ -642,5 +642,47 @@ class Cli(unittest.TestCase):
         self.assertEqual(out["note"], "A scan is a list of charts that match a rule, not a list of stocks to buy.")
 
 
+class CryptoDailyTests(unittest.TestCase):
+    """Crypto trades 24/7: UTC daily bars, the live bar is never complete, no NYSE calendar."""
+
+    def series(self, closes, start=D(2026, 10, 1)):
+        ts = [int(DT(start.year, start.month, start.day, tzinfo=datetime.timezone.utc).timestamp()) + 86400 * i
+              for i in range(len(closes))]
+        return {"t": ts, "c": list(closes), "meta": {}}
+
+    def test_utc_day_bars_keep_their_utc_date(self):
+        # 00:00 UTC is 20:00 ET the day before: the stock path would date it a day early
+        s = self.series([1.0, 2.0, 3.0])
+        now = DT(2026, 10, 10, 12, 0)
+        got = scan.daily_closes(s, now, crypto=True)
+        self.assertEqual([d for d, _ in got], [D(2026, 10, 1), D(2026, 10, 2), D(2026, 10, 3)])
+
+    def test_todays_utc_bar_is_dropped_even_on_a_weekend(self):
+        s = self.series([1.0, 2.0, 3.0])
+        now = DT(2026, 10, 3, 12, 0)  # Saturday, the third bar is still forming
+        got = scan.daily_closes(s, now, crypto=True)
+        self.assertEqual([d for d, _ in got], [D(2026, 10, 1), D(2026, 10, 2)])
+
+    def test_default_universe_is_usd_pairs(self):
+        self.assertTrue(scan.CRYPTO_UNIVERSE)
+        self.assertTrue(all(x.endswith("-USD") for x in scan.CRYPTO_UNIVERSE))
+        self.assertIn("BTC-USD", scan.CRYPTO_UNIVERSE)
+
+    def test_scan_daily_crypto_keeps_sub_dollar_precision_and_skips_liquidity(self):
+        closes = [0.10] * 29 + [0.0599, 0.0598]  # a slide: oversold
+        data = {"DOGE-USD": self.series(closes, D(2026, 9, 1))}
+        hits, counts, _ = scan.scan_daily(data, ["DOGE-USD"], DT(2026, 10, 12, 12, 0), 0.0, 0, crypto=True)
+        self.assertEqual(counts["illiquid"], 0)
+        self.assertEqual(hits[0]["price"], 0.0598)
+
+    def test_money_keeps_digits_under_a_dollar(self):
+        self.assertEqual(scan.money(0.059856), "$0.059856")
+        self.assertEqual(scan.money(65305.06), "$65,305.06")
+
+    def test_stock_daily_defaults_unchanged(self):
+        code, text, _ = run(["daily", "--offline", DAILY, "--now", "2026-10-19 10:00", "--no-write", "--json"])
+        self.assertEqual(json.loads(text)["filters"], {"min_price": 5.0, "min_volume": 1000000})
+
+
 if __name__ == "__main__":
     unittest.main()
