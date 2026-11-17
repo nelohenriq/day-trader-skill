@@ -176,6 +176,21 @@ def parse_now(text):
     return (dt - dt.utcoffset()).replace(tzinfo=None)
 
 
+def parse_now_utc(text):
+    """--now for crypto -> naive UTC. A bare time ("2026-11-17 14:35" or 14:35 for today) is UTC."""
+    t = text.strip()
+    if t.upper().endswith(" UTC"):
+        t = t[:-4].strip()
+    if re.match(r"^\d{1,2}:\d{2}$", t):
+        t = "%s %s" % (utc_now().date().isoformat(), t.zfill(5))
+    t = t.replace("Z", "+00:00")
+    try:
+        dt = datetime.datetime.fromisoformat(t)
+    except ValueError:
+        raise EntryError('--now wants a UTC time like "2026-11-17 14:35" for crypto')
+    return dt.replace(tzinfo=None) if dt.tzinfo is None else (dt - dt.utcoffset()).replace(tzinfo=None)
+
+
 def parse_hhmm(text, what):
     m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*$", str(text))
     if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
@@ -552,6 +567,206 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     return res
 
 
+# ---------------------------------------------------------------- crypto (24/7, UTC)
+
+CRYPTO_OR_MINUTES = 60      # no natural open: the range is the first hour after --range-start
+
+
+def is_crypto_symbol(sym):
+    return sym.upper().endswith(("-USD", "-USDT", "-USDC"))
+
+
+def crypto_symbol(sym):
+    """BTC -> BTC-USD; BTC-USD stays."""
+    sym = sym.upper()
+    return sym if "-" in sym else sym + "-USD"
+
+
+def rp(x):
+    """Round a crypto price: cents at a dollar or more, six places under it."""
+    if x is None:
+        return None
+    x = float(x)
+    return round(x, 2 if abs(x) >= 1 else 6) + 0.0
+
+
+def px(x):
+    return ("$%.2f" % x) if abs(x) >= 1 else ("$%.6f" % x).rstrip("0").rstrip(".")
+
+
+def evaluate_crypto(chart, now_utc, setup="orb", or_minutes=CRYPTO_OR_MINUTES, interval="5m", level=None,
+                    min_volume_x=None, range_start="00:00", until=None):
+    """Pure. The crypto twin of evaluate(): the UTC day is the session, the range is the first
+    `or_minutes` after `range_start` (UTC), entries run to 00:00 UTC (or `until`). Only closed bars count."""
+    if interval not in INTERVALS:
+        raise EntryError("--interval is 5m or 1m")
+    step = INTERVALS[interval]
+    if or_minutes <= 0 or (or_minutes * 60) % step:
+        raise EntryError("--or-minutes must be a whole number of %s bars" % interval)
+    if setup not in ("orb", "level"):
+        raise EntryError("--setup is orb or level")
+    if setup == "level" and level is None:
+        raise EntryError("--setup level needs --level PRICE (for example a 20-day high)")
+    n_or = or_minutes * 60 // step
+    day = now_utc.date()
+    t0 = parse_hhmm(range_start, "--range-start")
+    start = datetime.datetime.combine(day, t0)
+    or_end = start + datetime.timedelta(minutes=or_minutes)
+    day_end = datetime.datetime.combine(day, datetime.time(0, 0)) + datetime.timedelta(days=1)
+    cutoff = min(day_end, datetime.datetime.combine(day, parse_hhmm(until, "--until"))) if until else day_end
+    res = {"symbol": chart["symbol"], "asset": "crypto", "timezone": "UTC", "setup": setup, "side": "buy",
+           "date": day.isoformat(), "interval": interval, "or_minutes": or_minutes,
+           "now": now_utc.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting", "phase": "", "reason": "",
+           "opening_range": None, "level": None, "trigger": None, "last": None, "forming": None,
+           "min_volume_x": min_volume_x, "range_start": hm(start), "no_entries_after": hm(cutoff) if cutoff < day_end else "24:00",
+           "prev_close": chart.get("prev_close"), "_bars": []}
+    dt = chart.get("data_time")
+    res["data_time"] = utc_of(dt).strftime("%Y-%m-%d %H:%M:%S") if dt else None
+
+    by_slot = {}
+    for b in chart["bars"]:
+        if b["t"] % step:
+            continue                       # the live tick is not a bar
+        bt = utc_of(b["t"])
+        if not (start <= bt < day_end):
+            continue
+        slot = int((bt - start).total_seconds()) // step
+        by_slot[slot] = dict(b, et=bt, end=bt + datetime.timedelta(seconds=step), slot=slot)
+    bars, pending = [], None
+    now_ts = ts_of(now_utc)
+    top = max(by_slot) if by_slot else -1
+    for slot in sorted(by_slot):
+        b = by_slot[slot]
+        end_ts = b["t"] + step
+        if end_ts <= now_ts:
+            if dt is None or dt >= end_ts or slot < top or now_ts >= end_ts + SETTLE:
+                bars.append(b)
+            else:
+                pending = b
+                res["forming"] = {"bar_start": hm(b["et"]), "closes": hm(b["end"]), "price": rp(b["c"])}
+                res["lag_note"] = "the %s bar counts once Yahoo catches up (a minute at most)" % hm(b["et"])
+        elif b["et"] <= now_utc:
+            res["forming"] = {"bar_start": hm(b["et"]), "closes": hm(b["end"]), "price": rp(b["c"])}
+    res["_bars"] = bars
+    res["bars_closed"] = len(bars)
+
+    if now_utc < start:
+        res.update(phase="pre-open", reason="the range starts at %s UTC" % hm(start))
+        return res
+    or_bars = [b for b in bars if b["slot"] < n_or]
+    avg_vol = (sum(b["v"] for b in or_bars) / float(len(or_bars))) if or_bars else None
+    if or_bars:
+        res["opening_range"] = {"high": rp(max(b["h"] for b in or_bars)), "low": rp(min(b["l"] for b in or_bars)),
+                                "minutes": or_minutes, "bars": len(or_bars), "of": n_or,
+                                "complete": now_utc >= or_end, "avg_volume": int(round(avg_vol))}
+    if setup == "orb":
+        if now_utc < or_end:
+            res.update(phase="forming", reason="%d of %d range bars closed; the range is set at %s UTC" % (
+                len(or_bars), n_or, hm(or_end)))
+            return res
+        if not or_bars:
+            res.update(status="no-data", phase="open", reason="Yahoo sent no bars for the range")
+            return res
+        lvl = max(b["h"] for b in or_bars)
+    else:
+        lvl = float(level)
+    res["level"] = rp(lvl)
+
+    first_slot = n_or if setup == "orb" else 0
+    trig, thin = None, []
+    for b in bars:
+        if b["slot"] < first_slot or b["end"] > cutoff:
+            continue
+        if b["c"] > lvl:
+            vx = (b["v"] / avg_vol) if avg_vol else None
+            if min_volume_x and (vx is None or vx < min_volume_x):
+                thin.append(b)
+                continue
+            trig = b
+            break
+    last = bars[-1] if bars else None
+    if last:
+        res["last"] = {"bar_start": hm(last["et"]), "close": rp(last["c"]),
+                       "vs_level_pct": round(100.0 * (last["c"] / lvl - 1), 2) + 0.0}
+    if trig:
+        vx = (trig["v"] / avg_vol) if avg_vol else None
+        res.update(status="triggered", phase="open",
+                   reason="the %s UTC bar closed above %s" % (hm(trig["et"]), "the range high" if setup == "orb" else "the level"))
+        res["trigger"] = {"time": hm(trig["end"]) + " UTC", "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
+                          "bar_index": trig["slot"], "price": rp(trig["c"]), "close": trig["c"],
+                          "volume": trig["v"], "volume_x": round(vx, 2) if vx is not None else None,
+                          "pct_over": round(100.0 * (trig["c"] / lvl - 1), 2) + 0.0}
+        res["minutes_since"] = int((now_utc - trig["end"]).total_seconds() // 60)
+        return res
+    if not bars:
+        res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % day.isoformat())
+        return res
+    what = ("close above the range high %s" if setup == "orb" else "close above %s") % px(lvl)
+    if now_utc >= cutoff and not (pending and pending["end"] <= cutoff):
+        res.update(status="expired", phase="after-cutoff",
+                   reason="no %s by %s UTC, the end of the entry window" % (what, hm(cutoff) if cutoff < day_end else "24:00"))
+        return res
+    res["phase"] = "open"
+    gap = lvl - last["c"]
+    if last["c"] > lvl and last in thin:
+        res["reason"] = "the %s UTC bar closed above at %s but on %.2fx the range's volume, under your %.2fx" % (
+            hm(last["et"]), px(last["c"]), last["v"] / avg_vol if avg_vol else 0, min_volume_x)
+    else:
+        res["reason"] = "last close %s (%s UTC bar), %s %s %s (%+.2f%%)" % (
+            px(last["c"]), hm(last["et"]), px(abs(gap)), "under" if gap >= 0 else "over",
+            "the range high %s" % px(lvl) if setup == "orb" else "the level %s" % px(lvl),
+            100.0 * (last["c"] / lvl - 1))
+    return res
+
+
+def describe_crypto(res):
+    when = datetime.datetime.strptime(res["now"], "%Y-%m-%d %H:%M:%S")
+    what = ("opening-range breakout (%d-minute range from %s UTC)" % (res["or_minutes"], res["range_start"])
+            if res["setup"] == "orb" else "close above %s" % px(res["level"]) if res["level"] is not None else "close above a level")
+    out = ["%s  %s %s UTC  %s on %s bars (crypto, 24/7, Yahoo, free, can lag)" % (
+        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), what,
+        "5-minute" if res["interval"] == "5m" else "1-minute")]
+    orr = res.get("opening_range")
+    if orr:
+        out.append("Range %s-%s UTC: high %s, low %s (%d of %d bars%s)." % (
+            res["range_start"], hm(datetime.datetime.strptime(res["range_start"], "%H:%M")
+                                   + datetime.timedelta(minutes=orr["minutes"])),
+            px(orr["high"]), px(orr["low"]), orr["bars"], orr["of"], "" if orr["complete"] else ", still forming"))
+    t = res.get("trigger")
+    if t:
+        out.append("TRIGGERED %s at %s: the %s UTC bar (bar %d) closed above %s %s (%+.2f%%)." % (
+            t["time"], px(t["price"]), t["bar_start"], t["bar_index"],
+            "the range high" if res["setup"] == "orb" else "the level", px(res["level"]), t["pct_over"]))
+        if res.get("minutes_since", 0) > INTERVALS[res["interval"]] // 60 and res.get("last"):
+            out.append("That was %d minutes ago; the last close is %s. A late entry is a different trade."
+                       % (res["minutes_since"], px(res["last"]["close"])))
+        out.append("Nothing was placed.")
+        out.append("Next: set the stop and target BEFORE you buy: /trader-exit.")
+    else:
+        label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
+        out.append("%s  %s." % (label, res["reason"]))
+        f = res.get("forming")
+        if res.get("lag_note") and res["status"] == "waiting":
+            out.append(res["lag_note"] + ".")
+        elif f and res["status"] == "waiting" and res["phase"] in ("open", "forming"):
+            out.append("The %s UTC bar is still forming (%s so far, closes %s); it does not count until it closes." % (
+                f["bar_start"], px(f["price"]), f["closes"]))
+        if res["status"] == "expired":
+            out.append("No entry on this setup today. Nothing was placed.")
+    out.append("Crypto trades around the clock: a stop can gap, and nothing here halts the market.")
+    return out
+
+
+def evaluate_for(asset, chart, now, o):
+    """One door for the commands: o holds the options of either asset class."""
+    if asset == "crypto":
+        return evaluate_crypto(chart, now, setup=o["setup"], or_minutes=o["or_minutes"], interval=o["interval"],
+                               level=o["level"], min_volume_x=o["min_volume_x"], range_start=o.get("range_start", "00:00"),
+                               until=o.get("until"))
+    return evaluate(chart, now, setup=o["setup"], or_minutes=o["or_minutes"], interval=o["interval"],
+                    level=o["level"], min_volume_x=o["min_volume_x"], cfg=o["cfg"])
+
+
 def public(res):
     """The result without the internal bar list, ready for JSON."""
     return {k: v for k, v in res.items() if not k.startswith("_")}
@@ -561,12 +776,13 @@ def entry_doc(res, now_utc):
     """trader/entry.json, the contract shape (plus a plain-words reason)."""
     t = res.get("trigger") or {}
     orr = res.get("opening_range")
-    return {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
+    extra = {"asset": "crypto", "timezone": "UTC"} if res.get("asset") == "crypto" else {}
+    return dict(extra, **{"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
             "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
             "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")})
 
 
 def write_json(path, doc):
@@ -779,6 +995,95 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
         next_fetch = now + datetime.timedelta(seconds=max(1, wait))
 
 
+def crypto_bar_line(b, res):
+    lvl = res.get("level")
+    orr = res.get("opening_range") or {}
+    t = res.get("trigger")
+    if res["setup"] == "orb" and b["slot"] < (orr.get("of") or 0):
+        note = "range bar"
+        if b["slot"] == orr["of"] - 1:
+            note = "range set: high %s, low %s" % (px(orr["high"]), px(orr["low"]))
+    elif t and t["bar_index"] == b["slot"]:
+        note = "TRIGGERED: closed above %s (%+.2f%%). Get in now if you take it: %s, %s" % (
+            px(lvl), t["pct_over"], t["time"], px(t["price"]))
+    elif lvl is None:
+        note = ""
+    elif b["c"] > lvl:
+        note = "above %s" % px(lvl)
+    else:
+        note = "%s under %s" % (px(lvl - b["c"]), px(lvl))
+    return "%5s UTC bar  closed %s  %s" % (hm(b["et"]), px(b["c"]), note)
+
+
+def watch_crypto(provider, clock, sleep, emit, opts, every=30, until=None, max_errors=5, on_trigger=None):
+    """Poll bar by bar until a trigger (0), the end of the UTC day or --until (1). Mirrors watch_loop,
+    with no calendar: crypto never closes, it only rolls over at 00:00 UTC."""
+    step = INTERVALS[opts.get("interval", "5m")]
+    start_day = clock().date()
+    printed, errors, first = -1, 0, True
+    next_fetch = None
+    while True:
+        now = clock()
+        if next_fetch is not None and now < next_fetch:
+            sleep(max(1, min(every, (next_fetch - now).total_seconds())))
+            continue
+        if now.date() != start_day:
+            emit("The UTC day rolled over without a trigger. Start a new watch for the new day.")
+            return 1, None
+        try:
+            chart = provider(now)
+            errors = 0
+        except EntryError as e:
+            errors += 1
+            emit("%s UTC  could not read bars: %s" % (now.strftime("%H:%M:%S"), e))
+            if errors >= max_errors:
+                emit("Stopping after %d failed reads in a row." % errors)
+                return 1, None
+            next_fetch = now + datetime.timedelta(seconds=every)
+            continue
+        res = evaluate_for("crypto", chart, now, opts)
+        bars = res["_bars"]
+        lines = describe_crypto(res)
+        if first:
+            emit(lines[0])
+            if len(lines) > 1 and lines[1].startswith("Range"):
+                emit(lines[1])
+            if bars and not res.get("trigger"):
+                emit(crypto_bar_line(bars[-1], res))
+            printed = bars[-1]["slot"] if bars else -1
+            fresh, first = True, False
+        else:
+            fresh = False
+            for b in bars:
+                if b["slot"] > printed:
+                    emit(crypto_bar_line(b, res))
+                    printed = b["slot"]
+        if res["status"] == "triggered":
+            for line in lines[1:]:
+                if line.startswith("Range") or (line.startswith("TRIGGERED") and not fresh):
+                    continue
+                emit(line)
+            if on_trigger:
+                on_trigger(res, now)
+            return 0, res
+        if res["status"] == "expired":
+            emit("EXPIRED  %s." % res["reason"])
+            return 1, res
+        if until and now >= until:
+            emit("Stopped at --until %s UTC without a trigger. %s." % (hm(until), res["reason"]))
+            return 1, res
+        # next fetch just after the next bar closes, or in `every` seconds if Yahoo is behind
+        day0 = datetime.datetime.combine(now.date(), datetime.time(0, 0))
+        cur = int((now - day0).total_seconds()) // step
+        expected_last = (cur - 1)
+        behind = (not bars) or int((bars[-1]["et"] - day0).total_seconds()) // step < expected_last
+        wait = every if behind else (day0 + datetime.timedelta(seconds=(cur + 1) * step + GRACE) - now).total_seconds()
+        for stop_at in (until, day0 + datetime.timedelta(days=1)):
+            if stop_at and stop_at > now:
+                wait = min(wait, (stop_at - now).total_seconds())
+        next_fetch = now + datetime.timedelta(seconds=max(1, wait))
+
+
 # ---------------------------------------------------------------- commands
 
 def _opts(a, cfg):
@@ -790,8 +1095,33 @@ def _opts(a, cfg):
         raise EntryError("--min-volume-x must be above 0")
     if a.level is not None and a.level <= 0:
         raise EntryError("--level must be a price above 0")
-    return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
+    return {"setup": a.setup, "or_minutes": 15 if a.or_minutes is None else a.or_minutes, "interval": a.interval, "level": a.level,
             "min_volume_x": a.min_volume_x, "cfg": cfg}
+
+
+def _asset(a, sym):
+    asset = getattr(a, "asset", None) or ("crypto" if is_crypto_symbol(sym) else "stock")
+    if asset == "crypto" and a.setup not in ("orb", "level"):
+        raise EntryError("--setup is orb or level")
+    return asset
+
+
+def _crypto_opts(a):
+    o = _opts(a, None)
+    o["or_minutes"] = a.or_minutes if a.or_minutes is not None else CRYPTO_OR_MINUTES
+    o["range_start"] = a.range_start
+    parse_hhmm(a.range_start, "--range-start")
+    return o
+
+
+def _load_crypto(a, sym, now):
+    """(chart, now) with the UTC day as the session."""
+    real_today = utc_now().date()
+    if a.offline and now is None:
+        ch = get_chart(sym, a.interval, offline=a.offline)
+        return ch, (utc_of(ch["data_time"]) if ch.get("data_time") else utc_now())
+    now = now or utc_now()
+    return get_chart(sym, a.interval, now.date(), a.offline, real_today), now
 
 
 def _load(a, sym, now):
@@ -804,7 +1134,26 @@ def _load(a, sym, now):
     return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today), now
 
 
+def cmd_check_crypto(a):
+    opts = _crypto_opts(a)
+    sym = crypto_symbol(a.symbol)
+    chart, now = _load_crypto(a, sym, parse_now_utc(a.now) if a.now else None)
+    res = evaluate_for("crypto", chart, now, opts)
+    if a.write:
+        write_json(a.write, entry_doc(res, now))
+    if a.json:
+        print(json.dumps(public(res), indent=2))
+    else:
+        for line in describe_crypto(res):
+            print(line)
+        if a.write:
+            print("Wrote %s (status %s)." % (a.write, res["status"]))
+    return 0 if res["status"] == "triggered" else 1
+
+
 def cmd_check(a):
+    if _asset(a, a.symbol) == "crypto":
+        return cmd_check_crypto(a)
     cfg = read_config(a.config)
     opts = _opts(a, cfg)
     sym = a.symbol.upper()
@@ -822,7 +1171,40 @@ def cmd_check(a):
     return 0 if res["status"] == "triggered" else 1
 
 
+def cmd_watch_crypto(a):
+    opts = _crypto_opts(a)
+    sym = crypto_symbol(a.symbol)
+    if a.every <= 0:
+        raise EntryError("--every must be above 0 seconds")
+    start = parse_now_utc(a.now) if a.now else None
+    if a.offline or start is not None:
+        if start is None:
+            start = _load_crypto(a, sym, None)[1]
+        clock = SimClock(start)
+        now_fn, sleep_fn = clock.now, clock.sleep
+    else:
+        now_fn, sleep_fn = utc_now, _sleep
+    real_today = utc_now().date()
+
+    def provider(now):
+        return get_chart(sym, a.interval, now.date(), a.offline, real_today)
+
+    until = None
+    if a.until:
+        until = datetime.datetime.combine(now_fn().date(), parse_hhmm(a.until, "--until"))
+
+    def on_trigger(res, now):
+        write_json(a.out, entry_doc(res, now))
+        print("Wrote %s." % a.out, flush=True)
+
+    code, _ = watch_crypto(provider, now_fn, sleep_fn, lambda line: print(line, flush=True), opts,
+                           every=a.every, until=until, on_trigger=on_trigger)
+    return code
+
+
 def cmd_watch(a):
+    if _asset(a, a.symbol) == "crypto":
+        return cmd_watch_crypto(a)
     cfg = read_config(a.config)
     opts = _opts(a, cfg)
     sym = a.symbol.upper()
@@ -873,11 +1255,15 @@ def cmd_watchlist(a):
         raise EntryError("no hits in %s: the scanner found nothing to watch" % a.watchlist)
     if a.offline and not os.path.isdir(a.offline):
         raise EntryError("watchlist --offline wants a folder of <TICKER>.json files")
-    now = parse_now(a.now) if a.now else None
+    list_asset = a.asset or doc.get("asset") or None
+    now = None
     rows = []
     for i, h in enumerate(hits):
         sym = str(h["symbol"]).upper()
-        o = dict(opts)
+        asset = list_asset or ("crypto" if is_crypto_symbol(sym) else "stock")
+        o = _crypto_opts(a) if asset == "crypto" else dict(opts)
+        if a.now:
+            now = parse_now_utc(a.now) if asset == "crypto" else parse_now(a.now)
         if a.setup == "level" and o["level"] is None:
             o["level"] = h.get("level")
         try:
@@ -885,8 +1271,8 @@ def cmd_watchlist(a):
                 raise EntryError("needs a level: --level PRICE or a \"level\" in the watchlist")
             if i and not a.offline:
                 _sleep(PAUSE)
-            chart, when = _load(a, sym, now)
-            rows.append((sym, evaluate(chart, when, **o), None))
+            chart, when = (_load_crypto if asset == "crypto" else _load)(a, sym, now)
+            rows.append((sym, evaluate_for(asset, chart, when, o), None))
         except EntryError as e:
             rows.append((sym, None, str(e)))
     if a.json:
@@ -901,9 +1287,9 @@ def cmd_watchlist(a):
             last = r.get("last") or {}
             status = SHORT.get(r["phase"], r["status"]) if r["status"] != "triggered" else "triggered"
             print("%-6s  %-9s  %-8s  %-8s  %-9s  %-9s  %s" % (
-                s, status[:9], t.get("time") or "-", ("$%.2f" % t["price"]) if t else "-",
-                ("$%.2f" % r["level"]) if r.get("level") is not None else "-",
-                ("$%.2f" % last["close"]) if last else "-",
+                s, status[:9], t.get("time") or "-", px(t["price"]) if t else "-",
+                px(r["level"]) if r.get("level") is not None else "-",
+                px(last["close"]) if last else "-",
                 ("%+.2f%%" % last["vs_level_pct"]) if last.get("vs_level_pct") is not None else "-"))
         n = sum(1 for _, r, _ in rows if r and r["status"] == "triggered")
         print("%d of %d triggered. Pick one, then: entry.py check <TICKER> --write, and /trader-exit." % (n, len(rows)))
@@ -917,7 +1303,10 @@ def main(argv=None):
 
     def common(p):
         p.add_argument("--setup", choices=["orb", "level"], default="orb")
-        p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
+        p.add_argument("--or-minutes", type=int, default=None, help="range length in minutes (stocks 15, crypto 60)")
+        p.add_argument("--asset", choices=["stock", "crypto"], default=None,
+                       help="default: crypto for tickers like BTC-USD, else stock. Crypto uses UTC days, no calendar")
+        p.add_argument("--range-start", default="00:00", help="crypto: the range starts at this UTC time (00:00)")
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")

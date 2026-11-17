@@ -601,5 +601,110 @@ class SkillDoc(unittest.TestCase):
             self.assertNotIn(never, low)
 
 
+class CryptoEntryTests(unittest.TestCase):
+    """Crypto: the UTC day is the session, the range is the first 60 minutes, no calendar."""
+
+    DAY = datetime.datetime(2026, 11, 17)
+
+    def chart(self, closes, price0=100.0, vol=10):
+        """5-minute bars from 00:00 UTC; closes[i] closes bar i. High = close + 0.5, low = close - 0.5."""
+        base = int(self.DAY.replace(tzinfo=datetime.timezone.utc).timestamp())
+        bars = [{"t": base + 300 * i, "o": c, "h": c + 0.5, "l": c - 0.5, "c": c, "v": vol}
+                for i, c in enumerate(closes)]
+        return {"symbol": "BTC-USD", "meta": {}, "bars": bars, "prev_close": price0, "data_time": None}
+
+    def at(self, h, m):
+        return self.DAY.replace(hour=h, minute=m)
+
+    def opts(self, **kw):
+        o = {"setup": "orb", "or_minutes": 60, "interval": "5m", "level": None, "min_volume_x": None,
+             "range_start": "00:00", "cfg": None}
+        o.update(kw)
+        return o
+
+    def test_symbol_helpers(self):
+        self.assertTrue(entry.is_crypto_symbol("btc-usd"))
+        self.assertFalse(entry.is_crypto_symbol("TSLA"))
+        self.assertEqual(entry.crypto_symbol("eth"), "ETH-USD")
+        self.assertEqual(entry.crypto_symbol("BTC-USD"), "BTC-USD")
+
+    def test_range_forming_then_waiting(self):
+        ch = self.chart([100.0] * 6)
+        r = entry.evaluate_for("crypto", ch, self.at(0, 30), self.opts())
+        self.assertEqual(r["phase"], "forming")
+        ch = self.chart([100.0] * 14)
+        r = entry.evaluate_for("crypto", ch, self.at(1, 10), self.opts())
+        self.assertEqual(r["status"], "waiting")
+        self.assertEqual(r["opening_range"]["high"], 100.5)
+        self.assertEqual(r["level"], 100.5)
+
+    def test_trigger_is_the_first_closed_bar_above_the_range_high(self):
+        closes = [100.0] * 12 + [100.2, 100.4, 101.0, 102.0]   # bar 14 closes at 101.0 > 100.5
+        ch = self.chart(closes)
+        r = entry.evaluate_for("crypto", ch, self.at(1, 20), self.opts())
+        self.assertEqual(r["status"], "triggered")
+        self.assertEqual(r["trigger"]["bar_index"], 14)
+        self.assertEqual(r["trigger"]["price"], 101.0)
+        self.assertEqual(r["trigger"]["time"], "01:15 UTC")
+
+    def test_a_forming_bar_does_not_trigger(self):
+        closes = [100.0] * 12 + [100.2, 100.4, 101.0]
+        ch = self.chart(closes)
+        r = entry.evaluate_for("crypto", ch, self.at(1, 12), self.opts())   # bar 14 closes at 01:15
+        self.assertEqual(r["status"], "waiting")
+        self.assertEqual(r["forming"]["bar_start"], "01:10")
+
+    def test_works_on_a_weekend_and_a_holiday(self):
+        sat = datetime.datetime(2026, 11, 28)   # Saturday, day after Thanksgiving
+        base = int(sat.replace(tzinfo=datetime.timezone.utc).timestamp())
+        bars = [{"t": base + 300 * i, "o": 5.0, "h": 5.1, "l": 4.9, "c": 5.0, "v": 1} for i in range(14)]
+        ch = {"symbol": "BTC-USD", "meta": {}, "bars": bars, "prev_close": 5.0, "data_time": None}
+        r = entry.evaluate_for("crypto", ch, sat.replace(hour=1, minute=10), self.opts())
+        self.assertEqual(r["status"], "waiting")
+        self.assertEqual(r["opening_range"]["high"], 5.1)
+
+    def test_expires_at_the_end_of_the_utc_day(self):
+        ch = self.chart([100.0] * 200)
+        r = entry.evaluate_for("crypto", ch, self.at(23, 59), self.opts(until="23:00"))
+        self.assertEqual(r["status"], "expired")
+
+    def test_level_setup_and_volume_filter(self):
+        closes = [100.0] * 12 + [100.2, 100.4, 103.0]
+        ch = self.chart(closes)
+        r = entry.evaluate_for("crypto", ch, self.at(1, 20), self.opts(setup="level", level=102.0))
+        self.assertEqual(r["status"], "triggered")
+        thin = self.chart(closes)
+        thin["bars"][14]["v"] = 1   # the range averages 10
+        r = entry.evaluate_for("crypto", thin, self.at(1, 20), self.opts(min_volume_x=1.5))
+        self.assertEqual(r["status"], "waiting")
+
+    def test_sub_dollar_prices_keep_digits(self):
+        self.assertEqual(entry.rp(0.0598), 0.0598)
+        self.assertEqual(entry.rp(65305.056), 65305.06)
+        self.assertEqual(entry.px(0.059856), "$0.059856")
+
+    def test_entry_doc_carries_asset_and_timezone(self):
+        ch = self.chart([100.0] * 12 + [100.2, 100.4, 101.0])
+        now = self.at(1, 20)
+        r = entry.evaluate_for("crypto", ch, now, self.opts())
+        doc = entry.entry_doc(r, now)
+        self.assertEqual((doc["asset"], doc["timezone"], doc["status"]), ("crypto", "UTC", "triggered"))
+        self.assertEqual(doc["time"], "01:15 UTC")
+
+    def test_watch_replays_to_the_trigger(self):
+        ch = self.chart([100.0] * 12 + [100.2, 100.4, 101.0, 102.0, 103.0])
+        clock = entry.SimClock(self.at(0, 5))
+        out = []
+        code, res = entry.watch_crypto(lambda now: ch, clock.now, clock.sleep, out.append, self.opts(), every=30)
+        self.assertEqual(code, 0)
+        self.assertEqual(res["trigger"]["bar_index"], 14)
+        self.assertTrue(any("TRIGGERED" in line for line in out))
+
+    def test_stock_entry_doc_has_no_crypto_fields(self):
+        self.assertNotIn("asset", entry.entry_doc(
+            {"symbol": "TSLA", "setup": "orb", "date": "2026-10-19", "status": "waiting", "trigger": None,
+             "interval": "5m", "opening_range": None, "reason": ""}, datetime.datetime(2026, 10, 19, 14, 0)))
+
+
 if __name__ == "__main__":
     unittest.main()
