@@ -12,6 +12,7 @@ description: >-
   "where's my stop", "set my stop and target", "plan the exit", "when do I get
   out", "stop loss", "what's my R", "risk reward", or right after
   /trader-entry triggers, before /trader-timemachine.
+  Also works on crypto pairs like BTC-USD, 24/7 (turn it on with allow_crypto, paper by default).
 argument-hint: "[--stop or-mid|or-low|price:X|pct:X|atr:K] [--target 2R|1R|price:X]"
 ---
 
@@ -104,6 +105,20 @@ Exit plan: TSLA long, Mon 2026-10-19, opening-range breakout on 5-minute bars
 
 The default 2R target would be 364.18 + 2 x 5.86 = 375.90. trader-budget then
 sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
+
+## Crypto (24/7)
+
+`exit.py plan` reads a crypto `entry.json` (or `--symbol BTC-USD --entry ...`)
+and plans the same stop and target, with these differences:
+
+- Prices round to a step set by size: cents from $100 up, 0.0001 from $1 to
+  $100, 0.000001 below $1. A DOGE plan gives a stop of `$0.060250`, not `$0.06`.
+- There is no flat-by-close. `--max-hold-hours` (default 24, `0` = no time
+  limit, which warns) sets `exit_by`, a UTC time. `--flat-by` is refused for
+  crypto and `--max-hold-hours` is refused for stocks.
+- `--stop atr:K` reads the UTC day's bars up to the entry bar.
+- `plan.json` gets `asset`, `timezone`, `price_step`, `max_hold_hours` and
+  `exit_by`, and `flat_by` is `null`. Every later skill reads those.
 
 ## Rules
 

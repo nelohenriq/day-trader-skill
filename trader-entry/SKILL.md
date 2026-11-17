@@ -12,6 +12,7 @@ description: >-
   TSLA", "has it broken out", "did it break the opening range", "entry
   signal", "time my entry", "check my watchlist", or after /trader-scanner
   and /trader-news, before /trader-exit.
+  Also works on crypto pairs like BTC-USD, 24/7 (turn it on with allow_crypto, paper by default).
 argument-hint: "[TICKER] [--setup orb|level] [--interval 5m|1m]"
 ---
 
@@ -113,6 +114,23 @@ Next: set the stop and target BEFORE you buy: /trader-exit (exit.py plan --from 
 
 With `--min-volume-x 1` the 10:10 bar is too thin (0.60x the range's volume)
 and the trigger moves to 10:35 AM at 365.75 (the 10:30 bar, 7.98x).
+
+## Crypto (24/7)
+
+A ticker like `BTC-USD` (or `--asset crypto`) switches to the crypto path:
+`entry.py check BTC-USD`, `watch` and `watchlist` all work, and a bare `BTC`
+becomes `BTC-USD`. Crypto has no open and no calendar, so:
+
+- The UTC day is the session. The range is the first 60 minutes after
+  `--range-start` (default 00:00 UTC); change it with `--range-start` and
+  `--or-minutes`.
+- The trigger is the same: the first CLOSED bar after the range that closes
+  above its high (or above `--level`). Entries run until 00:00 UTC, or `--until`
+  (UTC). Weekends and holidays are ordinary days.
+- All times are UTC ("TRIGGERED 03:30 UTC at $64,983.22"). Sub-dollar prices
+  keep six decimals.
+- `entry.json` gets `"asset": "crypto"` and `"timezone": "UTC"`; `/trader-exit`
+  reads them.
 
 ## Rules
 

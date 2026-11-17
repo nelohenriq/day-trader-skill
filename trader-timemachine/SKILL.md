@@ -13,6 +13,7 @@ description: >-
   carlo", "backtest this setup", "how often does this hit the target", "is
   this a coin flip", or after /trader-exit writes a plan, before
   /trader-budget.
+  Also works on crypto pairs like BTC-USD, 24/7 (turn it on with allow_crypto, paper by default).
 argument-hint: "[path to plan.json, or TICKER]"
 ---
 
@@ -136,6 +137,24 @@ At 1R the target has to come first in half of the replays that hit one
 side. It did in 53.6 %. The replays came out close to a coin flip, and the
 real history was slightly worse than even. That is the honest answer for this setup, and it is what
 the user should hear before `/trader-budget` sizes 8 shares.
+
+## Crypto (24/7)
+
+A crypto plan (`asset: "crypto"`) replays the next `max_hold_hours` (default
+24, or `--hold-hours`) from the entry bar:
+
+- The day is the 288-bar UTC clock. Each bar is drawn from the coin's own bars
+  at the same time of day (+- 2 bars) over its last full UTC days (about 59),
+  and the clock wraps at 00:00 UTC, so a hold can cross midnight.
+- The history replays the plan's opening-range rule (range from 00:00 UTC, the
+  plan's stop rule and target R, the same hold) on every past full UTC day.
+  A day whose hold runs past the data is left out and counted.
+- The report and fan chart are in UTC and keep the coin's price digits. The
+  fan chart shows one column every 30 minutes.
+- Read the history line as well as the verdict. The simulation draws random
+  bars, so it can call a setup a coin flip while the rule itself has lost money
+  on that coin. Both numbers are shown for that reason.
+- Same seed, same numbers. Stock results are unchanged.
 
 ## Rules
 

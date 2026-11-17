@@ -13,6 +13,7 @@ description: >-
   "watch my stop", "watch my trade", "remind me to close by 3:55", "is the
   market open", "when does the market open", "get me a price", or right
   after /trader-exit writes a plan.
+  Also works on crypto pairs like BTC-USD, 24/7 (turn it on with allow_crypto, paper by default).
 argument-hint: "[ticker] [price]"
 ---
 
@@ -136,6 +137,23 @@ open, close it: trader-broker flatten --symbol TSLA builds the sell ticket, then
 
 It rings once. The next morning the plan's three alerts are no longer
 watched; with `add --opening-bell`, the bell rings at 9:30.
+
+## Crypto (24/7)
+
+`alerts.py add --from-plan` on a crypto plan adds three rules: a stop, a target
+(noted "sell by hand", because crypto has no resting target) and an `exit_by`
+rule at the plan's UTC time.
+
+- `exit_by` is a new rule type with `"at_utc"`. It rings once, and tells you to
+  cancel the resting stop and run `ticket.py flatten`.
+- Stop and target carry `"until"` (the plan's `exit_by`) instead of a New York
+  date, so a 24-hour hold crosses midnight without the alerts dropping.
+- Quotes take `BTC/USD` or `BTC-USD`, come from Yahoo only (Stooq has no
+  crypto) and keep sub-dollar digits. The check says "is", not "last", because
+  crypto always trades, and prints a "Crypto trades 24/7" line instead of the
+  NYSE status.
+- The target alert is the only prompt to take profit: run `alerts.py check`
+  every few minutes with `/loop` or a scheduled task.
 
 ## Rules
 

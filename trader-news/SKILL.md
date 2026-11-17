@@ -89,6 +89,12 @@ in and out before the close. No new 8-K." At 10:52 the price line reads
 `TSLA 366.48 +3.31% vs yesterday's close 354.72 at 10:52 ET  MOVING`. When a
 ticker has no news, say so rather than padding the brief.
 
+## Crypto
+
+This skill is for US stocks. It has no crypto path: a ticker like `BTC-USD`
+has no SEC filings, no earnings and no congressional trades, so say so and
+point to `/trader-scanner --asset crypto` and `/trader-entry` instead.
+
 ## What it never does
 
 - Never invents or embellishes a story, a quote or a number.

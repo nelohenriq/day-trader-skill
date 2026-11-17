@@ -132,6 +132,12 @@ does not click it or automate it. The route:
    and you write it up in the same shape as the House rows, with the report
    link, and the same 45-day caveat.
 
+## Crypto
+
+This skill is for US stocks. It has no crypto path: a ticker like `BTC-USD`
+has no SEC filings, no earnings and no congressional trades, so say so and
+point to `/trader-scanner --asset crypto` and `/trader-entry` instead.
+
 ## What it never does
 
 - Never says or implies a member has inside information, or that copying a

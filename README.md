@@ -152,6 +152,37 @@ for the 60 days to October 19 2026, the 10:15 AM opening-range scan, Yahoo's
 TSLA headlines that morning, the House Clerk's 2026 index, real PTR text and
 real XBRL facts. They reproduce every number in the example above.
 
+## Crypto (branch `crypto-support`)
+
+The same chain works on crypto pairs like `BTC-USD`, around the clock, on
+Alpaca's paper account. It is off until you set `"allow_crypto": true` in
+`trader/config.json`, and paper stays the default.
+
+```
+/trader-scanner  scan.py daily --asset crypto       20 major -USD pairs, UTC daily bars
+/trader-entry    entry.py check BTC-USD             range = first 60 minutes after 00:00 UTC
+/trader-exit     exit.py plan --write               stop, target, and exit_by (default 24 hours)
+/trader-timemachine                                 replays the hold on the UTC clock, plus history
+/trader-budget   size.py --write                    fractional coins, entry + stop-loss after fill
+/trader-risk     check.py                           allow_crypto, gtc/ioc, no market window
+/trader-broker   ticket.py show / protect / flatten place_crypto_order, stop as its own ticket
+/trader-alerts   alerts.py add --from-plan          stop, target, and exit_by alerts
+```
+
+What is different from stocks:
+
+- **No bracket orders.** Alpaca crypto has none. The entry goes in alone; after
+  it fills, `ticket.py protect` builds the stop-loss as its own order with its
+  own yes. The target is an alert, because a second resting sell would lock the
+  same coins.
+- **Nothing protects you until that stop is in.** Crypto never halts and a stop
+  can fill far past its price.
+- **UTC, not New York.** No NYSE calendar, no open, no flat-by-close. A trade
+  ends at `exit_by` instead.
+- **Fractional coins**, prices to six decimals under a dollar.
+- `/trader-news`, `/trader-analyst` and `/trader-pelosi` are stock-only.
+- Futures, commodities and options are not covered.
+
 ## Fine print
 
 **Not financial advice.** This is software that reads public data and does

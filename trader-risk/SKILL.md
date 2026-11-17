@@ -15,6 +15,7 @@ description: >-
   an order that passed. Use when the user says "check my order", "is this
   safe", "risk check", "does this break my rules", "can I take this trade",
   "how much have I risked today", or before /trader-broker, always.
+  Also works on crypto pairs like BTC-USD, 24/7 (turn it on with allow_crypto, paper by default).
 argument-hint: "[path to orders.json]"
 ---
 
@@ -146,6 +147,27 @@ The same 8 shares checked at 10:55 with the real 10:52 quote (366.48) in
 reward:risk 0.44. At 9:40 they are blocked by the window (no new entries
 before 9:45). The 3:55 PM sell that closes the position passes, even though
 it is after the 3:30 entry cutoff: it is an exit.
+
+## Crypto (24/7)
+
+An order is crypto when it has `"asset": "crypto"` or a symbol like `BTC/USD`
+(`BTC-USD` and `btc/usd` are the same asset). It is blocked unless
+`"allow_crypto": true`. When it is allowed:
+
+- Format: `time_in_force` must be `gtc` or `ioc` (Alpaca has no day orders for
+  crypto), a bracket is refused, and a notional order must be a market order.
+- No market window, no holiday list and no PDT guard: crypto trades around the
+  clock.
+- Quantities are fractional coins and prices are not rounded to the cent, so a
+  $0.062 coin is measured correctly. The stop is read from
+  `after_fill.stop_loss.stop_price`, with a warning that it is placed after the
+  entry fills and nothing protects the position until then.
+- Everything else still applies: max loss per trade, reward:risk, the daily
+  loss and trades-per-day limits, the position cap, the cash buffer, blocked
+  tickers and duplicates. A sell of coins you hold is an exit and is never
+  blocked by the daily limits.
+- The fingerprint covers `after_fill`, so changing the stop after the check
+  invalidates the pass. Daily counters follow the New York date.
 
 ## Rules
 

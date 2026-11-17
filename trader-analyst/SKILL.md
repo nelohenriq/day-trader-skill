@@ -107,6 +107,12 @@ earlier, diluted EPS $2.02 (+28.7%). For Coca-Cola the tool noted that SEC's
 facts stopped at 2026-04-03 while the 10-Q for 2026-07-03 was already filed,
 so the summary read that 10-Q directly.
 
+## Crypto
+
+This skill is for US stocks. It has no crypto path: a ticker like `BTC-USD`
+has no SEC filings, no earnings and no congressional trades, so say so and
+point to `/trader-scanner --asset crypto` and `/trader-entry` instead.
+
 ## What it never does
 
 - Never says a stock is cheap, expensive, a buy or a sell. It reports what

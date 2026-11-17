@@ -12,6 +12,7 @@ description: >-
   trade", "how much should I buy", "I have $5,000", "I only want to risk $50
   a trade", "set my rules", "keep 10% in cash", or after /trader-exit writes
   a plan.
+  Also works on crypto pairs like BTC-USD, 24/7 (turn it on with allow_crypto, paper by default).
 argument-hint: "[budget in dollars]"
 ---
 
@@ -139,6 +140,27 @@ With `"fractional": false` (the example config) it buys whole shares and
 needs prices (`--prices trader/prices.json`). These are plain buys with no stop: trader-risk blocks them while
 `require_stop` is true and counts each one against `max_trades_per_day`. Use
 a separate config (`--config`) for a long-term split.
+
+## Crypto (24/7)
+
+A plan with `asset: "crypto"` is sized in fractional coins (rounded DOWN to 9
+decimals) under the same four limits, on the UTC date. It needs
+`"allow_crypto": true` in the config for `/trader-risk` to pass it.
+
+Alpaca's crypto orders have no bracket class and no day orders, so the
+proposal is different from a stock's:
+
+1. The entry: `place_crypto_order`, symbol `BTC/USD`, market or limit,
+   `time_in_force` `gtc`.
+2. `after_fill.stop_loss`: a `stop_limit` sell to place AFTER the entry fills.
+   Its limit sits 0.5% under its stop so it can fill. It gets its own ticket and
+   its own yes (`/trader-broker`, `ticket.py protect`).
+3. `after_fill.take_profit`: an alert only. A second resting sell would lock the
+   same coins, so `/trader-alerts` rings and you sell by hand.
+
+A small budget meets the position cap first: BTC at $65,000 with a $5,000
+budget buys about 0.058 coins, so the $50 max loss is rarely the limit that
+binds.
 
 ## Rules
 

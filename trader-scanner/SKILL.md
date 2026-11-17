@@ -12,6 +12,7 @@ description: >-
   "what is breaking out", "opening range breakouts", "scan for bull flags",
   "oversold stocks", "pre-market scan", "build my watchlist", "what should I
   look at today", or at the start of a trading day before /trader-news.
+  Also works on crypto pairs like BTC-USD, 24/7 (turn it on with allow_crypto, paper by default).
 argument-hint: "[universe | daily | orb] [--at HH:MM]"
 ---
 
@@ -177,6 +178,21 @@ charts) tags BLK, CI, XOM and HD a 20-day breakout, CCL a bull flag, F, JPM
 and GE a reclaim of the 20-day average, and BAC, MS, RIVN and PLUG oversold,
 as the reel did. On closes it also tags KO (breakout), RCL (flag) and PNC (an
 oversold bounce).
+
+## Crypto (24/7)
+
+`scan.py daily --asset crypto` scans a built-in list of 20 major `-USD` pairs
+(BTC-USD, ETH-USD, SOL-USD and so on), or your own with `--symbols` or
+`--universe`. Same five setups, on daily closes, with these differences:
+
+- Crypto never closes, so a daily bar is a UTC day. Today's bar is always left
+  out, weekends included, so the scan reads closes through yesterday UTC.
+- No price or volume floor by default (`--min-price` and `--min-volume` still
+  work). Sub-dollar coins keep their digits ($0.059856, not $0.06).
+- The watchlist gets `"asset": "crypto"`. `trader-entry` reads it and picks the
+  crypto path by itself.
+- `orb` is for stocks only: crypto has no open, so there is no opening-range
+  scan. Use `/trader-entry` on a coin instead.
 
 ## Rules
 

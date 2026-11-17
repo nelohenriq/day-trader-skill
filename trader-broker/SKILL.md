@@ -14,6 +14,7 @@ description: >-
   says "place the order", "buy it", "execute", "send it to my broker",
   "close my position", "flatten", "get me out", "connect Alpaca", "set up
   paper trading", or after /trader-risk passes.
+  Also works on crypto pairs like BTC-USD, 24/7 (turn it on with allow_crypto, paper by default).
 argument-hint: "[order number]"
 ---
 
@@ -190,6 +191,30 @@ The user replies "yes". Claude records it, calls `place_stock_order`, and the
 card reads "Claude wants to use Place stock order" with that JSON and two
 buttons: Allow once, Deny. Allow once sends it to the paper account. The
 `why` and the plan stay in the file; they are never sent.
+
+## Crypto (24/7)
+
+A crypto order shows as a `place_crypto_order` ticket (paper by default).
+Claude sends only the fields that tool accepts: `symbol`, `side`, `qty`,
+`type`, `time_in_force`, `limit_price`, `stop_price`. `order_class`, `asset` and
+`after_fill` are ours and are never sent.
+
+Alpaca crypto has no bracket orders, so the flow has an extra step:
+
+1. `ticket.py show`, your yes, `place_crypto_order` for the ENTRY only, then
+   `ticket.py result --status placed --filled-qty Q --filled-price P`.
+2. Nothing protects the position until the stop is in. Check the coins you hold
+   with `get_open_position` (Alpaca takes a small fee in coins, so the quantity
+   is a little under the entry's), then run
+   `ticket.py protect --symbol BTC-USD --qty <coins held>`.
+3. `protect` writes the stop-loss as its own `stop_limit` sell. It goes through
+   `/trader-risk` as an exit and needs its own explicit yes.
+4. To leave early or at `exit_by`: cancel the resting stop first (`get_orders`,
+   `cancel_order_by_id`, both need approval), then `ticket.py flatten --symbol
+   BTC-USD`. A second sell on the same coins is rejected while the stop rests.
+
+The target is an alert, not an order. The three-way yes (risk PASS, your typed
+yes for that one ticket, Claude's Allow once card) is unchanged.
 
 ## What it never does
 
