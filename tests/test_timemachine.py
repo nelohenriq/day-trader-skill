@@ -610,5 +610,119 @@ class Cli(unittest.TestCase):
         self.assertEqual(again, text)
 
 
+def crypto_chart(days=25, start="2026-10-20", price=100.0, partial_to=60, seed=5):
+    """SYNTHETIC 5-minute BTC-USD bars on the UTC clock: `days` full days, then a partial last day (not market data)."""
+    import datetime as dt
+    rng = random.Random(seed)
+    t0 = int(dt.datetime.fromisoformat(start).replace(tzinfo=dt.timezone.utc).timestamp())
+    ts, o, h, l, c, v = [], [], [], [], [], []
+    p = price
+    for i in range(days * 288 + partial_to):
+        op = p
+        p = p * (1 + rng.uniform(-0.002, 0.0021))
+        ts.append(t0 + 300 * i)
+        o.append(op); c.append(p)
+        h.append(max(op, p) * 1.0005); l.append(min(op, p) * 0.9995); v.append(10)
+    meta = {"symbol": "BTC-USD", "dataGranularity": "5m", "regularMarketTime": ts[-1] + 120}
+    return json.dumps({"chart": {"result": [{"meta": meta, "timestamp": ts,
+                                             "indicators": {"quote": [{"open": o, "high": h, "low": l,
+                                                                       "close": c, "volume": v}]}}]}}), p
+
+
+def crypto_plan(**kw):
+    p = {"asset": "crypto", "symbol": "BTC-USD", "side": "buy", "date": "2026-11-14", "setup": "orb",
+         "entry": 100.0, "stop": 99.0, "target": 101.5, "entry_time": "00:30 UTC", "interval": "5m",
+         "opening_range": {"high": 100.2, "low": 99.4, "minutes": 60}, "stop_rule": "or_mid",
+         "price_step": "0.0001", "max_hold_hours": 6}
+    p.update(kw)
+    return p
+
+
+class CryptoMachine(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.text, cls.last = crypto_chart()
+        cls.now = tm.datetime.datetime(2026, 11, 14, 1, 0)
+
+    def run_tm(self, plan_over=None, **kw):
+        plan = tm.normalize_plan_crypto(crypto_plan(**(plan_over or {})))
+        kw.setdefault("replays", 300)
+        return tm.time_machine_crypto(self.text, plan, self.now, **kw)
+
+    def test_is_crypto_plan(self):
+        self.assertTrue(tm.is_crypto_plan({"symbol": "btc/usd"}))
+        self.assertTrue(tm.is_crypto_plan({"symbol": "X", "asset": "crypto"}))
+        self.assertFalse(tm.is_crypto_plan({"symbol": "TSLA"}))
+
+    def test_plan_normalises_utc_entry_and_hold(self):
+        p = tm.normalize_plan_crypto(crypto_plan(symbol="BTC/USD"))
+        self.assertEqual((p["symbol"], p["entry_bar"], p["entry_time"], p["hold_hours"]), ("BTC-USD", 5, "00:30 UTC", 6.0))
+        self.assertEqual(tm.step_digits("0.000001"), 6)
+        self.assertEqual(tm.step_digits("0.01"), 2)
+
+    def test_plan_refusals(self):
+        for bad in (dict(side="sell"), dict(stop=101.0), dict(entry_time="00:32 UTC"), dict(entry_time="00:00 UTC"),
+                    dict(max_hold_hours=100), dict(interval="1m")):
+            with self.assertRaises(tm.TMError, msg=str(bad)):
+                tm.normalize_plan_crypto(crypto_plan(**bad))
+
+    def test_no_time_limit_falls_back_to_24h_with_a_note(self):
+        p = tm.normalize_plan_crypto(crypto_plan(max_hold_hours=None))
+        self.assertEqual(p["hold_hours"], 24.0)
+        self.assertTrue(p["notes"])
+
+    def test_the_replay_runs_on_the_utc_clock_across_midnight(self):
+        doc = self.run_tm(plan_over=dict(entry_time="23:00 UTC", max_hold_hours=2, date="2026-11-13"))
+        self.assertEqual(doc["mc"]["bars_left"], 24)
+        self.assertEqual(doc["mc"]["until_label"], "2026-11-14 01:00 UTC")
+        self.assertAlmostEqual(doc["mc"]["p_target"] + doc["mc"]["p_stop"] + doc["mc"]["p_neither"], 1.0, places=3)
+
+    def test_pool_has_a_slot_for_every_five_minutes_of_the_day(self):
+        doc = self.run_tm()
+        self.assertEqual(doc["mc"]["pool_sessions"], 25)
+        self.assertEqual(doc["data"]["symbol"], "BTC-USD")
+
+    def test_same_seed_same_numbers_and_different_seed_differs(self):
+        a, b, c = self.run_tm(seed=3), self.run_tm(seed=3), self.run_tm(seed=4)
+        self.assertEqual(a["mc"]["p_target"], b["mc"]["p_target"])
+        self.assertEqual(a["mc"]["median_close"], b["mc"]["median_close"])
+        self.assertNotEqual(a["mc"]["median_close"], c["mc"]["median_close"])
+
+    def test_history_replays_the_rule_on_past_utc_days(self):
+        h = self.run_tm()["history"]
+        self.assertEqual(h["sessions"], 25)
+        self.assertEqual(h["target"] + h["stop"] + h["close"], h["triggered"])
+        self.assertEqual(h["rule"]["stop_rule"], "or_mid")
+
+    def test_entry_missing_from_the_data_is_refused(self):
+        with self.assertRaises(tm.TMError):
+            self.run_tm(plan_over=dict(entry_time="23:55 UTC"))
+
+    def test_report_and_chart_speak_utc(self):
+        doc = self.run_tm()
+        text = "\n".join(tm.report_crypto(doc))
+        self.assertIn("UTC", text)
+        self.assertIn("a coin", text)
+        self.assertNotIn("ET", text.replace("BTC", "").replace("target", "").replace("GET", ""))
+        chart = "\n".join(tm.render_chart(doc))
+        self.assertIn("UTC", chart)
+        self.assertIn("target", chart)
+
+    def test_sub_dollar_coin_keeps_six_decimals(self):
+        text, _ = crypto_chart(price=0.062)
+        plan = tm.normalize_plan_crypto(crypto_plan(symbol="DOGE-USD", entry=0.062, stop=0.06025, target=0.0655,
+                                                    price_step="0.000001", opening_range={"minutes": 60}))
+        text = text.replace("BTC-USD", "DOGE-USD")
+        doc = tm.time_machine_crypto(text, plan, self.now, replays=200)
+        self.assertEqual(plan["risk_per_share"], 0.00175)
+        self.assertGreater(len(str(doc["mc"]["median_close"]).split(".")[1]), 2)
+
+    def test_stock_simulate_is_unchanged_by_the_new_arguments(self):
+        pool = [[(1.0, 1.001, 0.999, 1.0005)] * 3 for _ in range(78)]
+        a = tm.simulate(pool, 100.0, 99.0, 102.0, 10, 40, replays=200, seed=7)
+        b = tm.simulate(pool, 100.0, 99.0, 102.0, 10, 40, replays=200, seed=7, nslots=78, wrap=False, nd=2)
+        self.assertEqual(a, b)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -65,6 +65,7 @@ Times are New York (ET) wall-clock; --now "2026-10-19 10:15" pins the clock.
 
 import argparse
 import datetime
+import decimal
 import gzip
 import json
 import math
@@ -346,13 +347,16 @@ def pct(a, q):
     return a[min(len(a) - 1, int(q * len(a)))]
 
 
-def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy"):
+def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy",
+             nslots=SESSION_BARS, wrap=False, nd=2):
     """Monte Carlo replays of bars k+1..last. Same draws and order as the reel's sim.py."""
     long = side == "buy"
     risk = (entry - stop) if long else (stop - entry)
     r_target = round(((target - entry) if long else (entry - target)) / risk, 4)
 
     def slot(rng, i):
+        if wrap:        # crypto: a 24-hour clock, the day wraps round at midnight UTC
+            return (i + (rng.randint(-window, window) if window else 0)) % nslots
         return i if window == 0 else min(SESSION_BARS - 1, max(1, i + rng.randint(-window, window)))
 
     rng = random.Random(seed)
@@ -379,7 +383,7 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
                         outcome = "target"
             p = cl
             if keep:
-                path.append(round(p, 2))
+                path.append(round(p, nd))
         outcomes.append(outcome or "close")
         closes.append(p)
         if keep:
@@ -405,7 +409,7 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
     bands = []
     for j in range(last - k + 1):
         col = sorted(pp[j] for pp in allp)
-        bands.append([round(pct(col, q), 2) for q in BAND_Q])
+        bands.append([round(pct(col, q), nd) for q in BAND_Q])
     lo_, hi_ = pct(srt, 0.01), pct(srt, 0.99)
     W = (hi_ - lo_) / HIST_BINS
     bins = [0] * HIST_BINS
@@ -417,10 +421,10 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
         "replays": replays, "seed": seed, "window": window, "bars_left": last - k,
         "p_target": round(cnt["target"] / replays, 4), "p_stop": round(cnt["stop"] / replays, 4),
         "p_neither": round(cnt["close"] / replays, 4), "p_green": round(green / replays, 4),
-        "median_close": round(pct(srt, 0.5), 2), "p5_close": round(pct(srt, 0.05), 2),
-        "p95_close": round(pct(srt, 0.95), 2), "avg_R": round(statistics.mean(Rs), 3),
+        "median_close": round(pct(srt, 0.5), nd), "p5_close": round(pct(srt, 0.05), nd),
+        "p95_close": round(pct(srt, 0.95), nd), "avg_R": round(statistics.mean(Rs), 3),
         "r_at_target": r_target, "band_paths": BAND_PATHS, "bands": bands, "sample_paths": paths,
-        "hist": {"lo": round(lo_, 2), "hi": round(hi_, 2), "bins": bins},
+        "hist": {"lo": round(lo_, nd), "hi": round(hi_, nd), "bins": bins},
     }
 
 
@@ -508,7 +512,9 @@ def load_plan(a, now_utc):
         missing = [f for f in ("entry", "stop", "target", "entry_time") if getattr(a, f) is None]
         if missing:
             raise TMError("with --symbol also give %s" % ", ".join("--" + m.replace("_", "-") for m in missing))
-        raw = {"symbol": a.symbol, "side": a.side, "date": a.date or to_eastern(now_utc).date().isoformat(),
+        crypto_flag = is_crypto_plan({"symbol": a.symbol})
+        raw = {"symbol": a.symbol, "side": a.side,
+               "date": a.date or (now_utc if crypto_flag else to_eastern(now_utc)).date().isoformat(),
                "entry": a.entry, "stop": a.stop, "target": a.target, "entry_time": a.entry_time,
                "setup": a.setup, "opening_range": {"minutes": a.or_minutes}, "stop_rule": a.stop_rule,
                "interval": "5m"}
@@ -525,6 +531,8 @@ def load_plan(a, now_utc):
         if not isinstance(raw, dict):
             raise TMError("%s is not a plan" % a.plan)
         src = a.plan
+    if is_crypto_plan(raw):
+        return normalize_plan_crypto(raw, src)
     return normalize_plan(raw, src)
 
 
@@ -624,6 +632,8 @@ def resolve_rule(plan, entry_day):
 # ---------------------------------------------------------------- the run
 
 def _until12(mc):
+    if mc.get("until_label"):
+        return mc["until_label"]              # crypto: "2026-11-18 03:30 UTC"
     t = mc.get("until") or "16:00"
     return clock12(int(t[:2]) * 60 + int(t[3:]))
 
@@ -753,6 +763,335 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     }
 
 
+# ---------------------------------------------------------------- crypto (24/7: the UTC day is the session)
+
+DAY_BARS = 288               # a UTC day in 5-minute bars
+CRYPTO_BAND_STEP = 6         # the fan chart shows one column every 30 minutes
+DEFAULT_HOLD_HOURS = 24.0
+
+
+def is_crypto_plan(raw):
+    sym = str(raw.get("symbol") or "").strip().upper()
+    return raw.get("asset") == "crypto" or bool(re.match(r"^[A-Z0-9]{2,10}[/-]USD[TC]?$", sym))
+
+
+def utc_clock(text, what):
+    """'03:30', '03:30 UTC' -> minutes after midnight UTC."""
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*(?:UTC)?\s*$", str(text or ""), re.I)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        raise TMError("%s wants a UTC time like 03:30 or 03:30 UTC, not %r" % (what, text))
+    return int(m.group(1)) * 60 + int(m.group(2))
+
+
+def step_digits(step):
+    return max(2, -decimal.Decimal(str(step)).as_tuple().exponent)
+
+
+def step_away(x, long, q):
+    """Round a stop to the price step, away from the entry: down for a buy, up for a sell."""
+    n = x / q
+    n = math.floor(n + 1e-9) if long else math.ceil(n - 1e-9)
+    return round(n * q, step_digits(("%.10f" % q).rstrip("0")))
+
+
+def normalize_plan_crypto(raw, src="flags"):
+    """A crypto plan (trader/plan.json with asset crypto) -> the checked plan the crypto time machine runs."""
+    sym = str(raw.get("symbol") or "").strip().upper().replace("/", "-")
+    if not re.match(r"^[A-Z0-9]{2,10}-USD[TC]?$", sym):
+        raise TMError("the plan needs a crypto pair like BTC-USD, got %r" % raw.get("symbol"))
+    if str(raw.get("side") or "buy").lower() != "buy":
+        raise TMError("crypto cannot be sold short: the time machine replays buys only")
+    if str(raw.get("interval") or "5m") != "5m":
+        raise TMError("5-minute bars only (the plan says %s)" % raw.get("interval"))
+    try:
+        date = datetime.date.fromisoformat(str(raw.get("date") or "")).isoformat()
+    except ValueError:
+        raise TMError("the plan needs a date like 2026-11-17 (the UTC day), got %r" % raw.get("date"))
+    entry, stop, target = (_num(raw.get(k), k) for k in ("entry", "stop", "target"))
+    if not stop < entry < target:
+        raise TMError("a buy needs stop < entry < target (got stop %s, entry %s, target %s)" % (stop, entry, target))
+    if not raw.get("entry_time"):
+        raise TMError("the plan needs entry_time (the entry bar's close in UTC, e.g. 03:30 UTC)")
+    close_min = utc_clock(raw["entry_time"], "entry_time")
+    if close_min % 5 or close_min < 5:
+        raise TMError("entry_time %s is not on the 5-minute grid after 00:00 UTC (use the bar's close, e.g. 03:30 UTC)"
+                      % raw["entry_time"])
+    k = close_min // 5 - 1
+    notes = []
+    hold = raw.get("max_hold_hours", DEFAULT_HOLD_HOURS)
+    if hold is None or (isinstance(hold, (int, float)) and hold <= 0):
+        hold = DEFAULT_HOLD_HOURS
+        notes.append("the plan has no time limit: the replays run %g hours, the default" % DEFAULT_HOLD_HOURS)
+    try:
+        hold = float(hold)
+    except (TypeError, ValueError):
+        raise TMError("max_hold_hours must be a number of hours")
+    if hold * 12 != int(hold * 12) or hold > 72:
+        raise TMError("the hold must be a whole number of 5-minute bars and at most 72 hours (got %s)" % hold)
+    orng = raw.get("opening_range") or {}
+    or_min = int(orng.get("minutes", 60)) if isinstance(orng, dict) else 60
+    if or_min < 5 or or_min % 5 or or_min >= 1440:
+        raise TMError("opening_range.minutes must be a multiple of 5 (got %s)" % or_min)
+    step = str(raw.get("price_step") or ("0.01" if entry >= 100 else "0.0001" if entry >= 1 else "0.000001"))
+    nd = step_digits(step)
+    risk = entry - stop
+    return {
+        "asset": "crypto", "symbol": sym, "side": "buy", "date": date, "setup": str(raw.get("setup") or "orb"),
+        "entry": entry, "entry_time": "%02d:%02d UTC" % divmod(close_min, 60), "entry_bar": k,
+        "stop": stop, "target": target, "risk_per_share": round(risk, nd),
+        "target_r": round((target - entry) / risk, 2),
+        "opening_range": dict(orng, minutes=or_min) if isinstance(orng, dict) else {"minutes": or_min},
+        "stop_rule": str(raw.get("stop_rule") or "auto"), "interval": "5m", "price_step": step,
+        "hold_hours": hold, "flat_by": None, "from": src, "notes": notes,
+    }
+
+
+def parse_bars_crypto(result, now_utc):
+    """Yahoo chart result -> (meta, bars, dropped). All 5-minute bars on the UTC clock, oldest first;
+    unfinished and off-grid bars (the live tick) are dropped."""
+    meta = result.get("meta") or {}
+    stamps = result.get("timestamp") or []
+    q = ((result.get("indicators") or {}).get("quote") or [{}])[0] or {}
+    cols = [q.get(k) or [] for k in ("open", "high", "low", "close", "volume")]
+    as_of = now_utc
+    rmt = meta.get("regularMarketTime")
+    if isinstance(rmt, (int, float)) and utc_of(rmt) < as_of:
+        as_of = utc_of(rmt)
+    dropped = {"no_price": 0, "off_grid": 0, "not_complete": 0}
+    bars = {}
+    for i, ts in enumerate(stamps):
+        o, h, l, c, v = [col[i] if i < len(col) else None for col in cols]
+        if ts is None or None in (o, h, l, c):
+            dropped["no_price"] += 1
+            continue
+        ts = int(ts)
+        if ts % INTERVAL:
+            dropped["off_grid"] += 1
+            continue
+        start = utc_of(ts)
+        if start + datetime.timedelta(seconds=INTERVAL) > as_of:
+            dropped["not_complete"] += 1
+            continue
+        mins = start.hour * 60 + start.minute
+        bars[ts] = {"t": ts, "date": start.date().isoformat(), "slot": mins // 5, "start": start.strftime("%H:%M"),
+                    "o": o, "h": h, "l": l, "c": c, "v": v or 0}
+    return meta, [bars[t] for t in sorted(bars)], dropped
+
+
+def full_days_crypto(bars, before):
+    """UTC days before `before` with all 288 bars: [(date, [bars by slot])], and the short ones left out."""
+    days = {}
+    for b in bars:
+        days.setdefault(b["date"], {})[b["slot"]] = b
+    full, short = [], []
+    for d in sorted(days):
+        if d >= before:
+            continue
+        if len(days[d]) == DAY_BARS:
+            full.append((d, [days[d][i] for i in range(DAY_BARS)]))
+        else:
+            short.append({"date": d, "bars": len(days[d])})
+    return full, short
+
+
+def build_pool_crypto(full, by_t):
+    """pool[slot] = every past bar at that time of day as (o, h, l, c) / the previous bar's close."""
+    pool = [[] for _ in range(DAY_BARS)]
+    for _, D in full:
+        for b in D:
+            prev = by_t.get(b["t"] - INTERVAL)
+            if prev:
+                pc_ = prev["c"]
+                pool[b["slot"]].append((b["o"] / pc_, b["h"] / pc_, b["l"] / pc_, b["c"] / pc_))
+    return pool
+
+
+def resolve_rule_crypto(plan):
+    """orb, the plan's range, its stop rule (or_mid / or_low, else the plan's distance as a percent) and its R."""
+    if plan["setup"].lower() != "orb":
+        return None
+    sr = plan["stop_rule"] if plan["stop_rule"] in ("or_mid", "or_low") else "pct"
+    rule = {"setup": "orb", "or_minutes": plan["opening_range"]["minutes"], "stop_rule": sr,
+            "target_r": plan["target_r"], "stop_pct": round(100.0 * plan["risk_per_share"] / plan["entry"], 4)}
+    if sr != "pct":
+        del rule["stop_pct"]
+    return rule
+
+
+def history_replay_crypto(full, by_t, rule, hold_bars, step):
+    """The plan's rule on every past UTC day: range = the first or_minutes after 00:00 UTC, entry = the first
+    later bar to close above its high, then stop first, then target, bar by bar through the hold, else the
+    close at the end of the hold. A day whose hold would run past the data is left out."""
+    n = rule["or_minutes"] // 5
+    nd = step_digits(step)
+    q = float(step)
+    trades, skipped = [], 0
+    for d, D in full:
+        oh, ol = max(b["h"] for b in D[:n]), min(b["l"] for b in D[:n])
+        kk = next((i for i in range(n, DAY_BARS) if D[i]["c"] > oh), None)
+        if kk is None:
+            continue
+        t_entry = D[kk]["t"]
+        e = round(D[kk]["c"], nd)
+        if rule["stop_rule"] == "or_mid":
+            s = step_away((oh + ol) / 2, True, q)
+        elif rule["stop_rule"] == "or_low":
+            s = step_away(ol, True, q)
+        else:
+            s = step_away(e * (1 - rule["stop_pct"] / 100.0), True, q)
+        risk = e - s
+        if risk <= 0:
+            continue
+        t = round(e + rule["target_r"] * risk, nd)
+        seq = [by_t.get(t_entry + INTERVAL * j) for j in range(1, hold_bars + 1)]
+        if any(b is None for b in seq):
+            skipped += 1
+            continue
+        oc = None
+        for b in seq:
+            if b["l"] <= s:
+                oc = "stop"
+                break
+            if b["h"] >= t:
+                oc = "target"
+                break
+        cl = seq[-1]["c"]
+        R = (t - e) / risk if oc == "target" else -1.0 if oc == "stop" else (cl - e) / risk
+        trades.append({"date": d, "time": "%s UTC" % utc_of(t_entry + INTERVAL).strftime("%H:%M"), "entry": e,
+                       "stop": s, "target": t, "outcome": oc or "close", "R": round(R, 2)})
+    return {
+        "sessions": len(full), "triggered": len(trades), "left_out": skipped,
+        "target": sum(1 for x in trades if x["outcome"] == "target"),
+        "stop": sum(1 for x in trades if x["outcome"] == "stop"),
+        "close": sum(1 for x in trades if x["outcome"] == "close"),
+        "green": sum(1 for x in trades if x["R"] > 0),
+        "avg_R": round(statistics.mean(x["R"] for x in trades), 3) if trades else None,
+        "rule": rule, "trades": trades,
+    }
+
+
+def time_machine_crypto(text, plan, now_utc, replays=10000, seed=19, window=2, source="yahoo"):
+    """Chart JSON text + a normalized crypto plan -> the timemachine.json document."""
+    if not 1 <= replays <= 1000000:
+        raise TMError("--replays must be between 1 and 1,000,000")
+    if not 0 <= window <= 10:
+        raise TMError("--window must be between 0 and 10 bars")
+    sym = plan["symbol"]
+    result = chart_result(text, sym)
+    meta, bars, dropped = parse_bars_crypto(result, now_utc)
+    msym = str(meta.get("symbol") or "").upper()
+    if msym and msym != sym:
+        raise TMError("the data is for %s but the plan is for %s" % (msym, sym))
+    gran = meta.get("dataGranularity")
+    if gran and gran != "5m":
+        raise TMError("the data has %s bars; the time machine needs 5-minute bars" % gran)
+    if not bars:
+        raise TMError("no complete 5-minute bars for %s in the data" % sym)
+    k = plan["entry_bar"]
+    nd = step_digits(plan["price_step"])
+    by_t = {b["t"]: b for b in bars}
+    entry_day = {b["slot"]: b for b in bars if b["date"] == plan["date"]}
+    if k not in entry_day:
+        reason = ("no bars for that day" if not entry_day else "the data stops at the %s UTC bar"
+                  % entry_day[max(entry_day)]["start"])
+        raise TMError("the entry is not in the data: no complete bar (closing %s) on %s for %s (%s)"
+                      % (plan["entry_time"], plan["date"], sym, reason))
+    eb = entry_day[k]
+    warn = list(plan.get("notes") or [])
+    tol = plan["entry"] * 1e-4
+    if not eb["l"] - tol <= plan["entry"] <= eb["h"] + tol:
+        warn.append("the plan's entry %s is outside that bar's range %s to %s"
+                    % (plan["entry"], eb["l"], eb["h"]))
+    full, short = full_days_crypto(bars, plan["date"])
+    if len(full) < MIN_SESSIONS:
+        raise TMError("only %d full UTC day(s) of %s before %s in the data; the time machine needs at least %d"
+                      % (len(full), sym, plan["date"], MIN_SESSIONS))
+    hold_bars = int(round(plan["hold_hours"] * 12))
+    last = k + hold_bars
+    pool = build_pool_crypto(full, by_t)
+    mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, "buy",
+                  nslots=DAY_BARS, wrap=True, nd=nd)
+    end = datetime.datetime.combine(datetime.date.fromisoformat(plan["date"]), datetime.time(0, 0)) + \
+        datetime.timedelta(minutes=5 * (k + 1 + hold_bars))
+    idx = list(range(0, len(mc["bands"]), CRYPTO_BAND_STEP))
+    if idx[-1] != len(mc["bands"]) - 1:
+        idx.append(len(mc["bands"]) - 1)
+    t0 = datetime.datetime.combine(datetime.date.fromisoformat(plan["date"]), datetime.time(0, 0)) + \
+        datetime.timedelta(minutes=5 * (k + 1))
+    mc = dict(mc, until=end.strftime("%H:%M"), until_label=end.strftime("%Y-%m-%d %H:%M UTC"),
+              pool_sessions=len(full), pool_from=full[0][0], pool_to=full[-1][0],
+              bands=[mc["bands"][j] for j in idx],
+              band_times=[(t0 + datetime.timedelta(minutes=5 * j)).strftime("%H:%M") for j in idx])
+    rule = resolve_rule_crypto(plan)
+    plan_out = {kk: v for kk, v in plan.items() if v is not None and kk != "notes"}
+    if rule:
+        plan_out["stop_rule"] = rule["stop_rule"]
+        history = history_replay_crypto(full, by_t, rule, hold_bars, plan["price_step"])
+    else:
+        history = {"sessions": len(full), "triggered": 0, "rule": None, "trades": [],
+                   "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
+                           "this plan's setup is %r" % plan["setup"]}
+    last_bar = bars[-1]
+    return {
+        "created_by": "trader-timemachine", "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "source": source,
+        "data": {"symbol": msym or sym, "interval": "5m", "range": "60d",
+                 "last_bar": "%s %s UTC" % (last_bar["date"], last_bar["start"]),
+                 "dropped": dropped, "short_sessions_left_out": short},
+        "plan": plan_out, "mc": mc, "history": history,
+        "verdict": verdict(mc), "verdict_notes": verdict_notes(mc), "warnings": warn,
+        "note": ("A simulation built from %s's own last %d full UTC days. It is not a prediction: news, a hack, "
+                 "a listing or a crash can do things those days never did, and crypto never halts. "
+                 "Same seed, same numbers." % (sym, len(full))),
+    }
+
+
+def report_crypto(doc):
+    p, m, h = doc["plan"], doc["mc"], doc["history"]
+    nd = step_digits(p["price_step"])
+    f = lambda x: ("%." + str(nd) + "f") % x
+    until = m["until_label"]
+    lines = [
+        "%s buy, %s UTC: entry %s at %s, stop %s, target %s (%gR, risk %s a coin)."
+        % (p["symbol"], p["date"], f(p["entry"]), p["entry_time"], f(p["stop"]), f(p["target"]), p["target_r"],
+           f(p["risk_per_share"])),
+        "%s replays of the next %g hours, %s to %s (%d five-minute bars), seed %d."
+        % ("{:,}".format(m["replays"]), p["hold_hours"], p["entry_time"], until, m["bars_left"], m["seed"]),
+        "Each bar is drawn whole from %s's own 5-min bars at the same time of day on the UTC clock (+-%d bars) over "
+        "its last %d full days (%s to %s)." % (p["symbol"], m["window"], m["pool_sessions"], m["pool_from"], m["pool_to"]),
+        "",
+        "  target first   %s" % pc(m["p_target"]),
+        "  stop first     %s" % pc(m["p_stop"]),
+        "  neither        %-8s still open at %s" % (pc(m["p_neither"]), until),
+        "  green          %-8s target first, or above the entry at %s" % (pc(m["p_green"]), until),
+        "",
+        "  Price at %s: median %s, 90 %% of replays between %s and %s."
+        % (until, f(m["median_close"]), f(m["p5_close"]), f(m["p95_close"])),
+        "  Average R: %+.3f (R = the %s risk: +%gR at the target, -1R at the stop)."
+        % (m["avg_R"], f(p["risk_per_share"]), m["r_at_target"]),
+        "",
+    ]
+    if h.get("rule"):
+        ru = h["rule"]
+        stop_words = {"or_mid": "range midpoint", "or_low": "range low"}.get(ru["stop_rule"],
+                                                                              "%.2f %% from the entry" % ru.get("stop_pct", 0))
+        if h["triggered"]:
+            lines.append("History: the same rule (%d-min range from 00:00 UTC, stop at the %s, %gR target, %g-hour hold) "
+                         "on each of those %d real days fired %d times: %d target, %d stop, %d neither. Average R %+.3f%s."
+                         % (ru["or_minutes"], stop_words, ru["target_r"], p["hold_hours"], h["sessions"], h["triggered"],
+                            h["target"], h["stop"], h["close"], h["avg_R"],
+                            (" (%d left out: the hold ran past the data)" % h["left_out"]) if h.get("left_out") else ""))
+        else:
+            lines.append("History: the same rule never fired in those %d days." % h["sessions"])
+    else:
+        lines.append("History: " + h.get("note", "skipped."))
+    lines += ["", doc["verdict"]] + list(doc.get("verdict_notes") or []) + [""]
+    for w in doc.get("warnings") or []:
+        lines.append("Note: " + w + ".")
+    lines.append("Crypto trades around the clock: nothing here accounts for a gap through the stop.")
+    lines.append(doc["note"] + " Repeat this run with --seed %d." % m["seed"])
+    return lines
+
+
 # ---------------------------------------------------------------- output
 
 def pc(x):
@@ -814,6 +1153,8 @@ def report(doc):
 def render_chart(doc, height=17):
     """ASCII fan chart of the bands: one column per 5-min bar."""
     p, m = doc["plan"], doc["mc"]
+    crypto = p.get("asset") == "crypto"
+    nd = step_digits(p["price_step"]) if crypto else 2
     bands, times = m["bands"], m["band_times"]
     lo = min([b[0] for b in bands] + [p["stop"], p["target"]])
     hi = max([b[4] for b in bands] + [p["stop"], p["target"]])
@@ -836,22 +1177,26 @@ def render_chart(doc, height=17):
         marks[row(p["entry"])] = "entry"
     for r in (row(p["target"]), row(p["stop"])):
         grid[r] = ["-" if ch == " " else ch for ch in grid[r]]
-    out = ["%s %s, %s replay paths from the %s entry (seed %d)" % (
-        p["symbol"], p["date"], "{:,}".format(m.get("band_paths", BAND_PATHS)), p["entry_time"], m["seed"])]
+    out = ["%s %s%s, %s replay paths from the %s entry (seed %d)" % (
+        p["symbol"], p["date"], " UTC" if crypto else "", "{:,}".format(m.get("band_paths", BAND_PATHS)),
+        p["entry_time"], m["seed"])]
     for r in range(height):
         label = marks.get(r)
         price = {"target": p["target"], "stop": p["stop"], "entry": p["entry"]}.get(label, hi - r * step)
-        left = ("%9.2f |" % price) if (label or r in (0, height - 1)) else "          |"
+        if crypto:
+            left = (("%10." + str(nd) + "f |") % price) if (label or r in (0, height - 1)) else "           |"
+        else:
+            left = ("%9.2f |" % price) if (label or r in (0, height - 1)) else "          |"
         out.append(left + "".join(grid[r]) + ("  " + label if label else ""))
     axis = [" "] * len(bands)
     for j in sorted({0, len(bands) // 2, len(bands) - 1}):
         t = times[j]
         hh, mm = int(t[:2]), t[3:]
-        lab = "%d:%s" % (hh % 12 or 12, mm)
+        lab = ("%s:%s" % (t[:2], mm)) if crypto else "%d:%s" % (hh % 12 or 12, mm)
         s = max(0, min(j, len(bands) - len(lab)))
         axis[s:s + len(lab)] = list(lab)
-    out.append("          +" + "-" * len(bands))
-    out.append("           " + "".join(axis))
+    out.append(("           +" if crypto else "          +") + "-" * len(bands))
+    out.append(("            " if crypto else "           ") + "".join(axis))
     out.append("* median   : middle half of the paths   . 90 % of the paths   - stop and target")
     return out
 
@@ -874,6 +1219,10 @@ def compute(a):
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
+    if plan.get("asset") == "crypto":
+        if a.hold_hours is not None:
+            plan = dict(plan, hold_hours=a.hold_hours)
+        return time_machine_crypto(text, plan, now, a.replays, a.seed, a.window, source)
     return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source)
 
 
@@ -885,7 +1234,7 @@ def cmd_run(a):
         slim = dict(doc, mc={k: v for k, v in doc["mc"].items() if k != "sample_paths"})
         print(json.dumps(slim, indent=2))
     else:
-        print("\n".join(report(doc)))
+        print("\n".join(report_crypto(doc) if doc["plan"].get("asset") == "crypto" else report(doc)))
         if a.write:
             print("Wrote %s." % a.write)
         print("Next: /trader-budget sizes it to your budget and your max loss per trade.")
@@ -929,6 +1278,8 @@ def main(argv=None):
         p.add_argument("--seed", type=int, default=19)
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
         p.add_argument("--until", help="end each replay at this time (default 16:00, the close)")
+        p.add_argument("--hold-hours", type=float, default=None,
+                       help="crypto: replay this many hours after the entry (default: the plan's max_hold_hours, else 24)")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ISO with Z)')
 
