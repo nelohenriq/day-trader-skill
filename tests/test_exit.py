@@ -270,6 +270,108 @@ class Cli(unittest.TestCase):
         self.assertIn("No plan", text)
 
 
+CRYPTO_ENTRY = {"created_by": "trader-entry", "asset": "crypto", "timezone": "UTC", "symbol": "BTC-USD",
+                "setup": "orb", "side": "buy", "date": "2026-11-17", "status": "triggered", "time": "03:30 UTC",
+                "bar_start": "03:25", "bar_index": 41, "price": 64983.22, "level": 64868.70, "interval": "5m",
+                "opening_range": {"high": 64868.70, "low": 64380.41, "minutes": 60},
+                "source": "yahoo", "checked_at": "2026-11-17T05:08:00Z"}
+
+
+class Crypto(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+        os.mkdir("trader")
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def write_entry(self, doc=None):
+        with open("trader/entry.json", "w") as fh:
+            json.dump(doc or CRYPTO_ENTRY, fh)
+
+    def plan(self, *args):
+        return run(exitp, ["plan", "--now", "2026-11-17 00:20"] + list(args))   # 05:20 UTC
+
+    def test_money_keeps_crypto_digits_and_stock_cents(self):
+        self.assertEqual(exitp.money(364.18), "$364.18")
+        self.assertEqual(exitp.money(1234.5), "$1,234.50")
+        self.assertEqual(exitp.money("0.06025"), "$0.06025")
+        self.assertEqual(exitp.money("0.0655"), "$0.0655")
+
+    def test_quantum_by_price(self):
+        self.assertEqual(exitp.crypto_quantum(64983.22), Decimal("0.01"))
+        self.assertEqual(exitp.crypto_quantum(9.28), Decimal("0.0001"))
+        self.assertEqual(exitp.crypto_quantum(0.062), Decimal("0.000001"))
+
+    def test_compute_sub_dollar_coin(self):
+        sr, sp = exitp.parse_stop("or-mid")
+        tr, tp = exitp.parse_target("2R")
+        r = exitp.compute(0.062, sr, sp, tr, tp, 0.0615, 0.059, quantum=Decimal("0.000001"))
+        self.assertEqual(r["stop"], Decimal("0.060250"))
+        self.assertEqual(r["target"], Decimal("0.065500"))
+        self.assertEqual(r["reward_risk"], Decimal("2.00"))
+
+    def test_btc_plan_from_entry_json(self):
+        self.write_entry()
+        code, text, err = self.plan("--write")
+        self.assertEqual(code, 0, err)
+        with open("trader/plan.json") as fh:
+            p = json.load(fh)
+        self.assertEqual((p["asset"], p["timezone"], p["symbol"]), ("crypto", "UTC", "BTC-USD"))
+        self.assertEqual(p["stop"], 64624.55)
+        self.assertIsNone(p["flat_by"])
+        self.assertEqual(p["exit_by"], "2026-11-18T03:30:00Z")
+        self.assertEqual(p["entry_time"], "03:30 UTC")
+        self.assertIn("Exit by", text)
+        self.assertNotIn("Flat by", text)
+
+    def test_max_hold_hours(self):
+        self.write_entry()
+        code, _, _ = self.plan("--json", "--max-hold-hours", "6")
+        code, text, _ = self.plan("--json", "--max-hold-hours", "6")
+        self.assertEqual(json.loads(text)["exit_by"], "2026-11-17T09:30:00Z")
+        code, text, _ = self.plan("--json", "--max-hold-hours", "0")
+        self.assertIsNone(json.loads(text)["exit_by"])
+        self.assertTrue(any("No time exit" in w for w in json.loads(text)["warnings"]))
+
+    def test_flat_by_refused_for_crypto_and_max_hold_for_stocks(self):
+        self.write_entry()
+        code, _, err = self.plan("--flat-by", "15:55")
+        self.assertEqual(code, 1)
+        self.assertIn("--max-hold-hours", err)
+        with open("trader/entry.json", "w") as fh:
+            json.dump(REEL_ENTRY, fh)
+        code, _, err = run(exitp, ["plan", "--now", "2026-10-19 10:16", "--max-hold-hours", "4"])
+        self.assertEqual(code, 1)
+        self.assertIn("crypto", err)
+
+    def test_detects_crypto_from_the_ticker_flags(self):
+        code, text, err = self.plan("--symbol", "DOGE-USD", "--entry", "0.062", "--or-high", "0.0615",
+                                    "--or-low", "0.059", "--json")
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        self.assertEqual((p["asset"], p["stop"], p["target"]), ("crypto", 0.06025, 0.0655))
+
+    def test_show_does_not_need_flat_by_for_crypto(self):
+        self.write_entry()
+        self.plan("--write")
+        code, text, _ = run(exitp, ["show", "--now", "2026-11-17 00:20"])
+        self.assertEqual(code, 0)
+        self.assertIn("Exit by", text)
+
+    def test_stock_plan_still_has_flat_by_and_no_crypto_fields(self):
+        with open("trader/entry.json", "w") as fh:
+            json.dump(REEL_ENTRY, fh)
+        code, text, err = run(exitp, ["plan", "--now", "2026-10-19 10:16", "--json"])
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        self.assertEqual(p["flat_by"], "15:55")
+        self.assertNotIn("asset", p)
+
+
 class SkillDoc(unittest.TestCase):
     def test_skill_md(self):
         with open(os.path.join(ROOT, "trader-exit", "SKILL.md"), encoding="utf-8") as fh:
