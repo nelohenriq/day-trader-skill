@@ -93,6 +93,116 @@ class TicketShape(unittest.TestCase):
         self.assertEqual(ticket.max_loss(no_plan), (None, 358.32))
 
 
+CNOW = "2026-11-17 00:20"
+BTC_ORDER = {
+    "asset": "crypto", "symbol": "BTC/USD", "side": "buy", "qty": "0.0577", "type": "market",
+    "time_in_force": "gtc", "order_class": "simple",
+    "after_fill": {"stop_loss": {"symbol": "BTC/USD", "side": "sell", "qty": "0.0577", "type": "stop_limit",
+                                 "time_in_force": "gtc", "stop_price": "64624.55", "limit_price": "64301.43"},
+                   "take_profit": {"how": "alert", "price": "65521.23"}},
+    "why": "orb on BTC-USD", "plan": {"entry": 64983.22, "stop": 64624.55, "target": 65521.23, "max_loss": 20.7}}
+
+
+class Crypto(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.cwd = os.getcwd()
+        os.chdir(self.d)
+        os.mkdir("trader")
+        with open("trader/config.json", "w") as fh:
+            json.dump({"budget": 5000, "max_loss_per_trade_usd": 50, "allow_crypto": True, "paper": True}, fh)
+        with open("trader/orders.json", "w") as fh:
+            json.dump({"orders": [BTC_ORDER]}, fh)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+        shutil.rmtree(self.d)
+
+    def risk(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            return check.main(["--now", CNOW])
+
+    def tk(self, *argv):
+        return run(list(argv) + ["--now", CNOW]) if argv[0] not in ("approve",) else run(list(argv) + ["--now", CNOW])
+
+    def test_tool_input_is_only_what_place_crypto_order_accepts(self):
+        ti = ticket.tool_input(BTC_ORDER)
+        self.assertEqual(set(ti), {"symbol", "side", "qty", "type", "time_in_force"})
+        self.assertEqual(ticket.tool_name(BTC_ORDER), "place_crypto_order")
+        self.assertEqual(ticket.tool_name(tsla()), "place_stock_order")
+        self.assertNotIn("after_fill", ti)
+        self.assertNotIn("order_class", ti)
+
+    def test_plain_ticket_explains_the_separate_stop_and_the_alert(self):
+        text = ticket.plain(BTC_ORDER)
+        self.assertIn("BUY 0.0577 BTC/USD", text)
+        self.assertIn("SEPARATE order", text)
+        self.assertIn("alert only", text)
+        self.assertIn("$64,624.55", text)
+
+    def test_fingerprint_changes_if_the_stop_changes(self):
+        other = json.loads(json.dumps(BTC_ORDER))
+        other["after_fill"]["stop_loss"]["stop_price"] = "60000"
+        self.assertNotEqual(ticket.fingerprint(BTC_ORDER), ticket.fingerprint(other))
+        self.assertEqual(ticket.fingerprint(BTC_ORDER), check.fingerprint(BTC_ORDER))
+
+    def test_not_ready_until_risk_has_passed_it(self):
+        code, text, _ = self.tk("show")
+        self.assertEqual(code, 1)
+        self.assertIn("NOT READY", text)
+        self.assertEqual(self.risk(), 0)
+        code, text, _ = self.tk("show")
+        self.assertEqual(code, 0)
+        self.assertIn("READY", text)
+        self.assertIn("place_crypto_order", text)
+
+    def test_full_flow_entry_fill_then_protect(self):
+        self.risk()
+        code, text, err = self.tk("approve", "--index", "1", "--reply", "yes")
+        self.assertEqual(code, 0, err)
+        self.assertIn("place_crypto_order", text)
+        code, text, err = self.tk("result", "--index", "1", "--status", "placed", "--broker-id", "x1",
+                                  "--filled-qty", "0.05762", "--filled-price", "64990")
+        self.assertEqual(code, 0, err)
+        with open("trader/portfolio.json") as fh:
+            pf = json.load(fh)
+        self.assertEqual(pf["positions"][0]["ticker"], "BTC/USD")
+        self.assertEqual(pf["positions"][0]["shares"], 0.05762)
+        code, text, err = self.tk("protect", "--symbol", "BTC-USD", "--qty", "0.05762")
+        self.assertEqual(code, 0, err)
+        with open("trader/orders.json") as fh:
+            o = json.load(fh)["orders"][0]
+        self.assertEqual((o["side"], o["type"], o["stop_price"], o["limit_price"], o["qty"]),
+                         ("sell", "stop_limit", "64624.55", "64301.43", "0.05762"))
+        self.assertEqual(self.risk(), 0)
+        code, text, _ = self.tk("show")
+        self.assertIn("READY", text)
+        with open("trader/state/risk.json") as fh:
+            self.assertEqual(json.load(fh)["results"][0]["kind"], "exit")
+
+    def test_protect_needs_a_placed_entry(self):
+        code, _, err = self.tk("protect", "--symbol", "BTC/USD")
+        self.assertEqual(code, 1)
+        self.assertIn("no placed", err)
+
+    def test_flatten_builds_a_crypto_sell(self):
+        self.risk()
+        self.tk("approve", "--index", "1", "--reply", "yes")
+        self.tk("result", "--index", "1", "--status", "placed", "--filled-qty", "0.05", "--filled-price", "64990")
+        code, text, err = self.tk("flatten", "--symbol", "btc-usd")
+        self.assertEqual(code, 0, err)
+        with open("trader/orders.json") as fh:
+            o = json.load(fh)["orders"][0]
+        self.assertEqual((o["symbol"], o["side"], o["time_in_force"], o["qty"]), ("BTC/USD", "sell", "gtc", "0.05"))
+        self.assertIn("place_crypto_order", text)
+
+    def test_stock_ticket_is_unchanged(self):
+        self.assertEqual(set(ticket.tool_input(tsla())),
+                         {"symbol", "side", "qty", "type", "time_in_force", "order_class",
+                          "take_profit_limit_price", "stop_loss_stop_price"})
+
+
 class DesktopConfig(unittest.TestCase):
     def test_example_is_paper_with_placeholder_keys(self):
         with open(os.path.join(ROOT, "trader-broker", "claude_desktop_config.example.json")) as fh:

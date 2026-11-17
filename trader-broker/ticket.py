@@ -45,6 +45,8 @@ ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
                  "stop_loss_limit_price", "advanced_instructions", "asset", "after_fill")
+CRYPTO_TOOL_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
+                      "stop_price", "client_order_id")   # what place_crypto_order accepts: nothing else
 STRING_FIELDS = ("qty", "notional", "limit_price", "stop_price", "trail_price", "trail_percent",
                  "take_profit_limit_price", "stop_loss_stop_price", "stop_loss_limit_price")
 TIF_WORDS = {"day": "good for today", "gtc": "good until canceled", "opg": "at the open",
@@ -57,6 +59,21 @@ DOUBT_WORDS = {"no", "not", "dont", "don't", "wait", "cancel", "stop", "but", "m
 
 class TicketError(Exception):
     pass
+
+
+def canon(sym):
+    """BTC-USD, btc/usd -> BTC/USD (one spelling of a crypto pair); anything else upper-cased."""
+    s_ = str(sym).strip().upper()
+    m = re.match(r"^([A-Z0-9]{2,10})[/-](USD[TC]?)$", s_)
+    return "%s/%s" % (m.group(1), m.group(2)) if m else s_
+
+
+def is_crypto(order):
+    return order.get("asset") == "crypto" or "/" in str(order.get("symbol", ""))
+
+
+def tool_name(order):
+    return "place_crypto_order" if is_crypto(order) else "place_stock_order"
 
 
 # ---------------------------------------------------------------- time (New York, no tz files)
@@ -170,7 +187,7 @@ def tool_input(order):
     numbers as strings (its signature types qty, notional and prices as str).
     "why" and "plan" are ours and are never sent."""
     out = {}
-    for k in ALPACA_FIELDS:
+    for k in (CRYPTO_TOOL_FIELDS if is_crypto(order) else ALPACA_FIELDS):
         if k in order and order[k] is not None:
             out[k] = _str_num(order[k]) if k in STRING_FIELDS else order[k]
     return out
@@ -186,6 +203,21 @@ def _p(v):
     return "%.2f" % float(v)
 
 
+def _pc(v):
+    """A crypto price: cents from a dollar up, six places under it, thousands separated."""
+    f = float(v)
+    return "{:,.2f}".format(f) if abs(f) >= 1 else ("%.6f" % f).rstrip("0").rstrip(".")
+
+
+def _mc(v):
+    return "$" + _pc(v)
+
+
+def after_fill(order):
+    af = order.get("after_fill")
+    return af if isinstance(af, dict) else {}
+
+
 def is_bracket(order):
     oc = str(order.get("order_class") or "").lower()
     legs = order.get("take_profit_limit_price") is not None or order.get("stop_loss_stop_price") is not None
@@ -194,6 +226,15 @@ def is_bracket(order):
 
 def max_loss(order):
     """(dollars, stop) lost if the stop fills exactly at the stop, or (None, stop)."""
+    if is_crypto(order):
+        stop = _f((after_fill(order).get("stop_loss") or {}).get("stop_price")) or _f((order.get("plan") or {}).get("stop"))
+        q, plan = _f(order.get("qty")), order.get("plan") or {}
+        if not stop or not q:
+            return None, stop
+        if _f(plan.get("max_loss")) is not None:
+            return round(_f(plan["max_loss"]), 2), stop
+        entry = _f(order.get("limit_price")) or _f(plan.get("entry"))
+        return (round(q * abs(entry - stop), 2) if entry else None), stop
     stop = _f(order.get("stop_loss_stop_price")) or _f((order.get("plan") or {}).get("stop"))
     q = _f(order.get("qty"))
     if not stop or not q:
@@ -217,6 +258,30 @@ def plain_parts(order):
     sym = order.get("symbol", "?")
     typ = str(order.get("type", "market"))
     tif = TIF_WORDS.get(str(order.get("time_in_force", "day")), order.get("time_in_force"))
+    if is_crypto(order):
+        if order.get("notional") is not None:
+            what = "%s of %s" % (_mc(order["notional"]), sym)
+        else:
+            what = "%s %s" % (_str_num(order.get("qty")), sym)
+        if typ == "limit":
+            how = "limit order at %s" % _mc(order.get("limit_price"))
+        elif typ == "stop_limit":
+            how = "stop %s, limit %s" % (_mc(order.get("stop_price")), _mc(order.get("limit_price")))
+        else:
+            how = "%s order" % typ.replace("_", " ")
+        parts = ["%s %s, %s, %s" % (side, what, how, tif)]
+        sl = after_fill(order).get("stop_loss")
+        if sl:
+            parts.append("then, as a SEPARATE order with its own yes: SELL %s %s stop-limit, stop %s, limit %s"
+                         % (_str_num(sl.get("qty")), sl.get("symbol", sym), _mc(sl["stop_price"]), _mc(sl["limit_price"])))
+        tp = after_fill(order).get("take_profit")
+        if tp:
+            parts.append("target %s is an alert only: no resting sell, you sell by hand" % _mc(tp["price"]))
+        loss, stop = max_loss(order)
+        if loss is not None:
+            parts.append("max loss about %s if the stop fills at %s (crypto never halts: it can fill worse)"
+                         % (_money(loss), _mc(stop)))
+        return parts
     if is_bracket(order):
         how = "limit %s" % _p(order["limit_price"]) if typ == "limit" and order.get("limit_price") else typ
         parts = ["%s %s %s, %s, %s" % (side, _str_num(order.get("qty")), sym, how, tif)]
@@ -262,6 +327,16 @@ def amount_numbers(order):
             v = _f(order[k])
             if v is not None:
                 nums.append(v)
+    if is_crypto(order):
+        sl = after_fill(order).get("stop_loss") or {}
+        for k in ("stop_price", "limit_price"):
+            if _f(sl.get(k)) is not None:
+                nums.append(_f(sl[k]))
+        tp = after_fill(order).get("take_profit") or {}
+        if _f(tp.get("price")) is not None:
+            nums.append(_f(tp["price"]))
+        if _f(order.get("stop_price")) is not None:
+            nums.append(_f(order["stop_price"]))
     loss, _ = max_loss(order)
     if loss is not None:
         nums.append(loss)
@@ -335,7 +410,7 @@ def status_of(order, risk, state, today):
     if rec:
         st = rec.get("status")
         if st == "approved":
-            return False, "APPROVED by you at %s, waiting for the place_stock_order call" % rec.get("at"), rv
+            return False, "APPROVED by you at %s, waiting for the %s call" % (rec.get("at"), tool_name(order)), rv
         return False, "DONE: %s at %s" % (st, rec.get("at")), rv
     return True, "READY: trader-risk PASS, waiting for your yes", rv
 
@@ -366,10 +441,14 @@ def render(order, idx, total, cfg, risk, state, today):
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
     else:
-        lines.append("  Claude will call place_stock_order with exactly:")
+        lines.append("  Claude will call %s with exactly:" % tool_name(order))
         for l in json.dumps(tool_input(order), indent=2).splitlines():
             lines.append("    " + l)
-        if is_bracket(order):
+        if is_crypto(order) and after_fill(order).get("stop_loss"):
+            lines.append("  Alpaca crypto has no bracket orders. This places the entry only. After it fills, record")
+            lines.append("  the fill, then run ticket.py protect to get the stop-loss as its own ticket and its own yes.")
+            lines.append("  Until that stop is in, nothing protects the position.")
+        elif is_bracket(order):
             lines.append("  Alpaca places the entry, then the stop-loss and the take-profit as two orders")
             lines.append("  that cancel each other: when one fills, the other is canceled.")
     if ready:
@@ -384,7 +463,7 @@ def ticket_json(order, idx, cfg, risk, state, today):
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
+            "broker": cfg.get("broker", "alpaca"), "tool": tool_name(order),
             "tool_input": tool_input(order), "why": order.get("why", ""),
             "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
 
@@ -400,14 +479,15 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
         if not budget:
             raise TicketError("no %s yet and no budget in the config to start it from" % portfolio_path)
         pf = {"cash": float(budget), "positions": []}
-    symbol = symbol.upper()
+    symbol = canon(symbol)
+    nd = 9 if "/" in symbol else 6          # coins go to 9 decimals, shares to 6
     qty, price = float(qty), float(price)
     if qty <= 0 or price <= 0:
         raise TicketError("a fill needs a positive qty and price")
     cost = round(qty * price, 2)
     pos = None
     for p in pf.setdefault("positions", []):
-        if str(p.get("ticker", "")).upper() == symbol:
+        if canon(p.get("ticker") or p.get("symbol") or "") == symbol:
             pos = p
     if side == "buy":
         if pos is None:
@@ -415,7 +495,7 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
             pf["positions"].append(pos)
         lots = pos.setdefault("lots", [])
         lots.append({"id": "%s-%d" % (symbol, len(lots) + 1), "date": date, "shares": qty, "cost": cost})
-        pos["shares"] = round(float(pos.get("shares", 0)) + qty, 6)
+        pos["shares"] = round(float(pos.get("shares", 0)) + qty, nd)
         pf["cash"] = round(float(pf.get("cash", 0)) - cost, 2)
     else:
         if pos is None or float(pos.get("shares", 0)) + 1e-9 < qty:
@@ -428,10 +508,10 @@ def apply_fill(portfolio_path, cfg, symbol, side, qty, price, date):
             take = min(left, float(lot["shares"]))
             per = float(lot["cost"]) / float(lot["shares"]) if float(lot["shares"]) else 0
             lot["cost"] = round(float(lot["cost"]) - per * take, 2)
-            lot["shares"] = round(float(lot["shares"]) - take, 6)
+            lot["shares"] = round(float(lot["shares"]) - take, nd)
             left -= take
         pos["lots"] = [l for l in pos.get("lots", []) if float(l["shares"]) > 1e-9]
-        pos["shares"] = round(float(pos["shares"]) - qty, 6)
+        pos["shares"] = round(float(pos["shares"]) - qty, nd)
         if pos["shares"] <= 1e-9:
             pf["positions"].remove(pos)
         pf["cash"] = round(float(pf.get("cash", 0)) + cost, 2)
@@ -443,9 +523,10 @@ def log_fill(state_path, now, today, symbol, side, qty, price):
     """A fill in the log, so trader-risk can count day trades (a buy and a sell the same day)."""
     state = load_state(state_path)
     state.setdefault("orders", []).append({
-        "at": ny_iso(now), "date": today, "status": "filled", "symbol": symbol.upper(), "side": side,
+        "at": ny_iso(now), "date": today, "status": "filled", "symbol": canon(symbol), "side": side,
         "qty": _str_num(float(qty)), "price": float(price),
-        "plain": "%s %s %s at %s" % (side.upper(), _str_num(float(qty)), symbol.upper(), _p(price))})
+        "plain": "%s %s %s at %s" % (side.upper(), _str_num(float(qty)), canon(symbol),
+                                     _pc(price) if "/" in canon(symbol) else _p(price))})
     write_json(state_path, state)
 
 
@@ -513,13 +594,17 @@ def cmd_approve(a):
            "qty": order.get("qty"), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,
            "plain": plain(order), "status": "approved", "reply": a.reply,
            "paper": bool(cfg.get("paper", True)), "broker": cfg.get("broker", "alpaca")}
+    if is_crypto(order):
+        rec["symbol"] = canon(order.get("symbol"))
+        if after_fill(order):
+            rec["after_fill"] = after_fill(order)
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
     if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
     else:
-        print("Now call place_stock_order with exactly:")
+        print("Now call %s with exactly:" % tool_name(order))
         print(json.dumps(tool_input(order), indent=2))
         print("Claude's card shows Allow once / Deny. Then: ticket.py result --index %d --status "
               "placed|denied|failed" % a.index)
@@ -547,7 +632,7 @@ def cmd_result(a):
         raise TicketError("order %d has no yes recorded today; a result can only follow an approval" % a.index)
     new = {"at": ny_iso(now), "date": today, "index": a.index, "fingerprint": fp, "symbol": rec["symbol"],
            "side": rec["side"], "plain": rec["plain"], "status": a.status}
-    for k in ("qty", "kind", "max_loss", "stop"):
+    for k in ("qty", "kind", "max_loss", "stop", "after_fill"):
         if rec.get(k) is not None:
             new[k] = rec[k]
     if a.broker_id:
@@ -566,6 +651,9 @@ def cmd_result(a):
               % (rec["symbol"], rec["side"]))
         if rec.get("kind") == "entry" and is_bracket(order):
             print("When the stop-loss or the take-profit fills later, record that sell the same way.")
+        if rec.get("kind") == "entry" and rec.get("after_fill"):
+            print("Crypto has no bracket: once the entry fills, record it (--filled-qty/--filled-price here or "
+                  "ticket.py fill), then run: ticket.py protect --symbol %s --qty <coins you hold>" % rec["symbol"])
     return 0
 
 
@@ -585,7 +673,8 @@ def cmd_fill(a):
 
 def cmd_flatten(a):
     cfg = read_json(a.config, "config", required=False) or {}
-    sym = a.symbol.strip().upper()
+    sym = canon(a.symbol)
+    crypto = "/" in sym
     now, today = _clock(a)
     source = "the broker, get_open_position"
     if a.qty is not None:
@@ -595,17 +684,24 @@ def cmd_flatten(a):
     else:
         pf = read_json(a.portfolio, "portfolio", required=False) or {}
         qty = sum(_f(p.get("shares", p.get("qty"))) or 0 for p in pf.get("positions", [])
-                  if str(p.get("ticker") or p.get("symbol") or "").upper() == sym)
+                  if canon(p.get("ticker") or p.get("symbol") or "") == sym)
         source = a.portfolio
         if qty <= 1e-9:
             raise TicketError("nothing to flatten: no %s shares in %s. Check the broker (get_open_position "
                               "%s) and pass --qty if you do hold some" % (sym, a.portfolio, sym))
     plan = read_json(a.plan, "plan", required=False) or {}
-    flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
-        or cfg.get("flat_by") or "15:55"
-    order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
-             "why": "flat by %s New York: closes the %s day trade before the close (qty from %s)"
-             % (flat_by, sym, source)}
+    if crypto:
+        exit_by = plan.get("exit_by") if canon(plan.get("symbol", "")) == sym else None
+        flat_by = ("%s UTC" % exit_by.replace("T", " ")[:16]) if exit_by else "now"
+        order = {"asset": "crypto", "symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market",
+                 "time_in_force": "gtc", "order_class": "simple",
+                 "why": "exit by %s: closes the %s position (qty from %s)" % (flat_by, sym, source)}
+    else:
+        flat_by = (plan.get("flat_by") if str(plan.get("symbol", "")).upper() == sym else None) \
+            or cfg.get("flat_by") or "15:55"
+        order = {"symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "market", "time_in_force": "day",
+                 "why": "flat by %s New York: closes the %s day trade before the close (qty from %s)"
+                 % (flat_by, sym, source)}
     old = read_json(a.orders, "orders", required=False)
     replaced = len(old.get("orders", [])) if isinstance(old, dict) else 0
     doc = {"created_by": "trader-broker", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": "proposed",
@@ -613,7 +709,8 @@ def cmd_flatten(a):
            "note": "Flatten ticket. Nothing is placed until trader-risk passes it and you say yes in the chat.",
            "source": "ticket.py flatten %s on %s" % (sym, today), "orders": [order]}
     write_json(a.orders, doc)
-    print("Flatten %s: %s (flat by %s New York)." % (sym, plain(order), flat_by))
+    print("Flatten %s: %s (%s)." % (sym, plain(order), ("exit by " + flat_by) if crypto else
+                                    "flat by %s New York" % flat_by))
     print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
                                              % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
     if a.qty is None:
@@ -622,9 +719,60 @@ def cmd_flatten(a):
     print("  1. trader-risk: check.py. A sell that only closes what you hold is never blocked by the daily")
     print("     limits or the entry window.")
     print("  2. ticket.py show, then the user's yes for this one order.")
-    print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
-    print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
-    print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
+    if crypto:
+        print("  3. The resting stop-loss holds these coins and Alpaca rejects a second sell. Cancel it first:")
+        print("     get_orders (status open), then cancel_order_by_id (Needs approval). Then place_crypto_order.")
+    else:
+        print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
+        print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
+        print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")
+    return 0
+
+
+def cmd_protect(a):
+    """The stop-loss of a crypto entry as its own ticket: Alpaca crypto has no bracket orders, so the
+    stop is placed AFTER the entry fills, with its own risk check and its own yes."""
+    cfg = read_json(a.config, "config", required=False) or {}
+    sym = canon(a.symbol)
+    now, today = _clock(a)
+    state = load_state(a.state)
+    rec = None
+    for r in state.get("orders", []):
+        if (r.get("status") == "placed" and rec_day(r) == today and canon(r.get("symbol", "")) == sym
+                and r.get("kind") == "entry" and r.get("after_fill")):
+            rec = r
+    if rec is None:
+        raise TicketError("no placed %s entry today with a stop-loss to follow it: place the entry first "
+                          "(ticket.py result --status placed), then record the fill" % sym)
+    sl = (rec["after_fill"] or {}).get("stop_loss")
+    if not sl:
+        raise TicketError("the %s entry has no stop_loss in after_fill" % sym)
+    if a.qty is not None:
+        qty = _f(a.qty)
+        source = "--qty"
+    else:
+        qty = _f(sl.get("qty")) or _f(rec.get("qty"))
+        source = "the entry's quantity"
+    if qty is None or qty <= 0:
+        raise TicketError("--qty wants the coins you hold, like --qty 0.0575")
+    order = {"asset": "crypto", "symbol": sym, "side": "sell", "qty": _str_num(qty), "type": "stop_limit",
+             "time_in_force": "gtc", "order_class": "simple", "stop_price": _str_num(sl["stop_price"]),
+             "limit_price": _str_num(sl["limit_price"]),
+             "why": "stop-loss for the %s entry (qty from %s; Alpaca takes a small fee in coins, so check "
+                    "get_open_position %s first)" % (sym, source, sym)}
+    old = read_json(a.orders, "orders", required=False)
+    replaced = len(old.get("orders", [])) if isinstance(old, dict) else 0
+    doc = {"created_by": "trader-broker", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "status": "proposed",
+           "paper": bool(cfg.get("paper", True)),
+           "note": "Stop-loss ticket. Nothing is placed until trader-risk passes it and you say yes in the chat.",
+           "source": "ticket.py protect %s on %s" % (sym, today), "orders": [order]}
+    write_json(a.orders, doc)
+    print("Stop-loss for %s: %s." % (sym, plain(order)))
+    print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
+                                             % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
+    print("Check the coins you hold with get_open_position %s first: the fee comes out of the coins, so the "
+          "quantity may be a little under the entry's." % sym)
+    print("Next: trader-risk check.py (a sell of coins you hold is an exit), then ticket.py show and the user's yes.")
     return 0
 
 
@@ -700,6 +848,14 @@ def main(argv=None):
     p.add_argument("--plan", default="trader/plan.json")
     p.add_argument("--config", default="trader/config.json")
     clock(p)
+    p = sub.add_parser("protect", help="the stop-loss of a crypto entry, as its own ticket (after the fill)")
+    p.add_argument("--symbol", required=True)
+    p.add_argument("--qty", help="coins you hold, from get_open_position (default: the entry's quantity)")
+    p.add_argument("--orders", default="trader/orders.json", help="where the ticket is written")
+    p.add_argument("--config", default="trader/config.json")
+    p.add_argument("--state", default="trader/state/broker.json")
+    p.add_argument("--now", help="pretend it is this New York time")
+    p.add_argument("--today", help="YYYY-MM-DD")
     p = sub.add_parser("log", help="today's decisions")
     p.add_argument("--state", default="trader/state/broker.json")
     clock(p)
@@ -710,7 +866,7 @@ def main(argv=None):
         return 1
     try:
         return {"show": cmd_show, "approve": cmd_approve, "decline": cmd_decline, "result": cmd_result,
-                "fill": cmd_fill, "flatten": cmd_flatten, "log": cmd_log}[a.cmd](a)
+                "fill": cmd_fill, "flatten": cmd_flatten, "protect": cmd_protect, "log": cmd_log}[a.cmd](a)
     except TicketError as e:
         print("ticket.py: %s" % e, file=sys.stderr)
         return 1
